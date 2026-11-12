@@ -41,6 +41,7 @@ extern void wm_sca_send_policies_scanned(wm_sca_t * data);
 extern int wm_sca_test_positive_minterm(const char * const pattern, const char * const str, char ** reason, w_expression_t * regex_engine);
 extern int wm_sca_regex_numeric_comparison(const char * const pattern, const char * const str, char ** reason, w_expression_t * regex_engine);
 extern int wm_sca_apply_numeric_partial_comparison(const char * const partial_comparison, const long int number, char ** reason, w_expression_t * regex_engine);
+extern int wm_sca_check_file_contents(const char * const file, const char * const pattern, char ** reason, w_expression_t * regex_engine);
 
 extern w_queue_t * request_queue;
 extern char **last_sha256;
@@ -82,6 +83,8 @@ static int setup_module() {
         "</policies>\n";
     lxml = malloc(sizeof(OS_XML));
 
+    expect_string(__wrap_realpath, path, "ruleset/sca");
+    will_return(__wrap_realpath, "/var/ossec/ruleset/sca");
     will_return(__wrap_opendir, 0);
     expect_string(__wrap__mtinfo, tag, "sca");
     expect_any(__wrap__mtinfo, formatted_msg);
@@ -91,7 +94,7 @@ static int setup_module() {
     will_return(__wrap_IsFile, 0);
 
     XML_NODE nodes = string_to_xml_node(string, lxml);
-    int ret = wm_sca_read(lxml, nodes, sca_module);
+    int ret = wm_sca_read(lxml, nodes, sca_module, 0);
     OS_ClearNode(nodes);
     test_mode = 0;
 
@@ -184,6 +187,8 @@ void test_fake_tag(void **state) {
 
     expect_string(__wrap__mterror, tag, "sca");
     expect_string(__wrap__mterror, formatted_msg, "No such tag 'fake' at module 'sca'.");
+    expect_string(__wrap_realpath, path, "ruleset/sca");
+    will_return(__wrap_realpath, "/var/ossec/ruleset/sca");
     will_return(__wrap_opendir, 0);
     expect_string(__wrap__mtinfo, tag, "sca");
     expect_any(__wrap__mtinfo, formatted_msg);
@@ -192,7 +197,7 @@ void test_fake_tag(void **state) {
     expect_string(__wrap_IsFile, file, "/var/ossec/etc/shared/your_policy_file.yml");
     will_return(__wrap_IsFile, 0);
 
-    assert_int_equal(wm_sca_read(&(test->xml), test->nodes, test->module),-1);
+    assert_int_equal(wm_sca_read(&(test->xml), test->nodes, test->module, 0),-1);
 }
 
 void test_read_scheduling_monthday_configuration(void **state) {
@@ -207,6 +212,8 @@ void test_read_scheduling_monthday_configuration(void **state) {
     test_structure *test = *state;
 
     expect_string(__wrap__mwarn, formatted_msg, "Interval must be a multiple of one month. New interval value: 1M");
+    expect_string(__wrap_realpath, path, "ruleset/sca");
+    will_return(__wrap_realpath, "/var/ossec/ruleset/sca");
     will_return(__wrap_opendir, 0);
     expect_string(__wrap__mtinfo, tag, "sca");
     expect_any(__wrap__mtinfo, formatted_msg);
@@ -216,7 +223,7 @@ void test_read_scheduling_monthday_configuration(void **state) {
     will_return(__wrap_IsFile, 0);
 
     test->nodes = string_to_xml_node(string, &(test->xml));
-    assert_int_equal(wm_sca_read(&(test->xml), test->nodes, test->module),0);
+    assert_int_equal(wm_sca_read(&(test->xml), test->nodes, test->module, 0),0);
     wm_sca_t* module_data = (wm_sca_t *)test->module->data;
     assert_int_equal(module_data->scan_config.scan_day, 7);
     assert_int_equal(module_data->scan_config.interval, 1);
@@ -237,6 +244,8 @@ void test_read_scheduling_weekday_configuration(void **state) {
     test_structure *test = *state;
 
     expect_string(__wrap__mwarn, formatted_msg, "Interval must be a multiple of one week. New interval value: 1w");
+    expect_string(__wrap_realpath, path, "ruleset/sca");
+    will_return(__wrap_realpath, "/var/ossec/ruleset/sca");
     will_return(__wrap_opendir, 0);
     expect_string(__wrap__mtinfo, tag, "sca");
     expect_any(__wrap__mtinfo, formatted_msg);
@@ -246,7 +255,7 @@ void test_read_scheduling_weekday_configuration(void **state) {
     will_return(__wrap_IsFile, 0);
 
     test->nodes = string_to_xml_node(string, &(test->xml));
-    assert_int_equal(wm_sca_read(&(test->xml), test->nodes, test->module),0);
+    assert_int_equal(wm_sca_read(&(test->xml), test->nodes, test->module, 0),0);
     wm_sca_t* module_data = (wm_sca_t *)test->module->data;
     assert_int_equal(module_data->scan_config.scan_day, 0);
     assert_int_equal(module_data->scan_config.interval, 604800);
@@ -265,6 +274,8 @@ void test_read_scheduling_daytime_configuration(void **state) {
         "</policies>\n";
     test_structure *test = *state;
 
+    expect_string(__wrap_realpath, path, "ruleset/sca");
+    will_return(__wrap_realpath, "/var/ossec/ruleset/sca");
     will_return(__wrap_opendir, 0);
     expect_string(__wrap__mtinfo, tag, "sca");
     expect_any(__wrap__mtinfo, formatted_msg);
@@ -274,7 +285,7 @@ void test_read_scheduling_daytime_configuration(void **state) {
     will_return(__wrap_IsFile, 0);
 
     test->nodes = string_to_xml_node(string, &(test->xml));
-    assert_int_equal(wm_sca_read(&(test->xml), test->nodes, test->module),0);
+    assert_int_equal(wm_sca_read(&(test->xml), test->nodes, test->module, 0),0);
     wm_sca_t* module_data = (wm_sca_t *)test->module->data;
     assert_int_equal(module_data->scan_config.scan_day, 0);
     assert_int_equal(module_data->scan_config.interval, WM_DEF_INTERVAL);
@@ -293,6 +304,8 @@ void test_read_scheduling_interval_configuration(void **state) {
         "</policies>\n";
     test_structure *test = *state;
 
+    expect_string(__wrap_realpath, path, "ruleset/sca");
+    will_return(__wrap_realpath, "/var/ossec/ruleset/sca");
     will_return(__wrap_opendir, 0);
     expect_string(__wrap__mtinfo, tag, "sca");
     expect_any(__wrap__mtinfo, formatted_msg);
@@ -302,12 +315,119 @@ void test_read_scheduling_interval_configuration(void **state) {
     will_return(__wrap_IsFile, 0);
 
     test->nodes = string_to_xml_node(string, &(test->xml));
-    assert_int_equal(wm_sca_read(&(test->xml), test->nodes, test->module),0);
+    assert_int_equal(wm_sca_read(&(test->xml), test->nodes, test->module, 0),0);
     wm_sca_t* module_data = (wm_sca_t *)test->module->data;
     assert_int_equal(module_data->scan_config.scan_day, 0);
     assert_int_equal(module_data->scan_config.interval, 7200);
     assert_int_equal(module_data->scan_config.month_interval, false);
     assert_int_equal(module_data->scan_config.scan_wday, -1);
+}
+
+/* policy->remote classification tests (GHSA-qmhg-366r-jjfp) */
+
+void test_wm_sca_policy_remote_agent_conf_outside_ruleset(void **state) {
+    const char *string =
+        "<enabled>yes</enabled>\n"
+        "<scan_on_start>no</scan_on_start>\n"
+        "<policies>\n"
+        "    <policy>/var/ossec/var/incoming/evil.yml</policy>\n"
+        "</policies>\n";
+    test_structure *test = *state;
+
+    expect_string(__wrap_realpath, path, "ruleset/sca");
+    will_return(__wrap_realpath, "/var/ossec/ruleset/sca");
+    will_return(__wrap_opendir, 0);
+    expect_string(__wrap__mtinfo, tag, "sca");
+    expect_any(__wrap__mtinfo, formatted_msg);
+    expect_string(__wrap_realpath, path, "/var/ossec/var/incoming/evil.yml");
+    will_return(__wrap_realpath, "/var/ossec/var/incoming/evil.yml");
+    expect_string(__wrap_IsFile, file, "/var/ossec/var/incoming/evil.yml");
+    will_return(__wrap_IsFile, 0);
+
+    test->nodes = string_to_xml_node(string, &(test->xml));
+    /* Policy activated from agent.conf (agent_cfg = 1), pointing outside ruleset/sca: must be remote */
+    assert_int_equal(wm_sca_read(&(test->xml), test->nodes, test->module, 1), 0);
+    wm_sca_t* module_data = (wm_sca_t *)test->module->data;
+    assert_int_equal(module_data->policies[0]->remote, 1);
+}
+
+void test_wm_sca_policy_remote_agent_conf_path_contains_ruleset_substring(void **state) {
+    const char *string =
+        "<enabled>yes</enabled>\n"
+        "<scan_on_start>no</scan_on_start>\n"
+        "<policies>\n"
+        "    <policy>/root/ruleset/sca/cis_ubuntu24-04.yml</policy>\n"
+        "</policies>\n";
+    test_structure *test = *state;
+
+    expect_string(__wrap_realpath, path, "ruleset/sca");
+    will_return(__wrap_realpath, "/var/ossec/ruleset/sca");
+    will_return(__wrap_opendir, 0);
+    expect_string(__wrap__mtinfo, tag, "sca");
+    expect_any(__wrap__mtinfo, formatted_msg);
+    expect_string(__wrap_realpath, path, "/root/ruleset/sca/cis_ubuntu24-04.yml");
+    will_return(__wrap_realpath, "/root/ruleset/sca/cis_ubuntu24-04.yml");
+    expect_string(__wrap_IsFile, file, "/root/ruleset/sca/cis_ubuntu24-04.yml");
+    will_return(__wrap_IsFile, 0);
+
+    test->nodes = string_to_xml_node(string, &(test->xml));
+    /* Path contains the "ruleset/sca" substring but is NOT under the actual resolved
+     * ruleset directory ("/var/ossec/ruleset/sca"): must still be remote. */
+    assert_int_equal(wm_sca_read(&(test->xml), test->nodes, test->module, 1), 0);
+    wm_sca_t* module_data = (wm_sca_t *)test->module->data;
+    assert_int_equal(module_data->policies[0]->remote, 1);
+}
+
+void test_wm_sca_policy_local_agent_conf_inside_ruleset(void **state) {
+    const char *string =
+        "<enabled>yes</enabled>\n"
+        "<scan_on_start>no</scan_on_start>\n"
+        "<policies>\n"
+        "    <policy>/var/ossec/ruleset/sca/my_policy.yml</policy>\n"
+        "</policies>\n";
+    test_structure *test = *state;
+
+    expect_string(__wrap_realpath, path, "ruleset/sca");
+    will_return(__wrap_realpath, "/var/ossec/ruleset/sca");
+    will_return(__wrap_opendir, 0);
+    expect_string(__wrap__mtinfo, tag, "sca");
+    expect_any(__wrap__mtinfo, formatted_msg);
+    expect_string(__wrap_realpath, path, "/var/ossec/ruleset/sca/my_policy.yml");
+    will_return(__wrap_realpath, "/var/ossec/ruleset/sca/my_policy.yml");
+    expect_string(__wrap_IsFile, file, "/var/ossec/ruleset/sca/my_policy.yml");
+    will_return(__wrap_IsFile, 0);
+
+    test->nodes = string_to_xml_node(string, &(test->xml));
+    /* Policy activated from agent.conf (agent_cfg = 1), but inside ruleset/sca: must stay local */
+    assert_int_equal(wm_sca_read(&(test->xml), test->nodes, test->module, 1), 0);
+    wm_sca_t* module_data = (wm_sca_t *)test->module->data;
+    assert_int_equal(module_data->policies[0]->remote, 0);
+}
+
+void test_wm_sca_policy_local_ossec_conf_outside_ruleset(void **state) {
+    const char *string =
+        "<enabled>yes</enabled>\n"
+        "<scan_on_start>no</scan_on_start>\n"
+        "<policies>\n"
+        "    <policy>/var/ossec/etc/shared/your_policy_file.yml</policy>\n"
+        "</policies>\n";
+    test_structure *test = *state;
+
+    expect_string(__wrap_realpath, path, "ruleset/sca");
+    will_return(__wrap_realpath, "/var/ossec/ruleset/sca");
+    will_return(__wrap_opendir, 0);
+    expect_string(__wrap__mtinfo, tag, "sca");
+    expect_any(__wrap__mtinfo, formatted_msg);
+    expect_string(__wrap_realpath, path, "/var/ossec/etc/shared/your_policy_file.yml");
+    will_return(__wrap_realpath, "/var/ossec/etc/shared/your_policy_file.yml");
+    expect_string(__wrap_IsFile, file, "/var/ossec/etc/shared/your_policy_file.yml");
+    will_return(__wrap_IsFile, 0);
+
+    test->nodes = string_to_xml_node(string, &(test->xml));
+    /* Policy activated from local ossec.conf (agent_cfg = 0), outside ruleset/sca: must stay local */
+    assert_int_equal(wm_sca_read(&(test->xml), test->nodes, test->module, 0), 0);
+    wm_sca_t* module_data = (wm_sca_t *)test->module->data;
+    assert_int_equal(module_data->policies[0]->remote, 0);
 }
 
 /* wm_sort_variables tests */
@@ -774,6 +894,131 @@ void test_wm_sca_apply_numeric_partial_comparison_no_operation_supported_with_re
     w_free_expression_t(&regex);
 }
 
+/* wm_sca_check_file_contents */
+
+typedef struct {
+    char dir[PATH_MAX];
+    char regular[PATH_MAX];
+    char fifo[PATH_MAX];
+    char missing[PATH_MAX];
+    w_expression_t * regex;
+    char * reason;
+} file_contents_state_t;
+
+static int setup_file_contents(void **state) {
+    file_contents_state_t * st = NULL;
+    os_calloc(1, sizeof(file_contents_state_t), st);
+
+    snprintf(st->dir, sizeof(st->dir), "/tmp/test_wm_sca_XXXXXX");
+    if (mkdtemp(st->dir) == NULL) {
+        os_free(st);
+        return -1;
+    }
+
+    snprintf(st->regular, sizeof(st->regular), "%s/regular", st->dir);
+    snprintf(st->fifo, sizeof(st->fifo), "%s/fifo", st->dir);
+    snprintf(st->missing, sizeof(st->missing), "%s/missing", st->dir);
+
+    FILE * fp = fopen(st->regular, "w");
+    if (fp == NULL) {
+        return -1;
+    }
+    fputs("first line\nsecond line\n", fp);
+    fclose(fp);
+
+    if (mkfifo(st->fifo, 0600) != 0) {
+        return -1;
+    }
+
+    w_calloc_expression_t(&st->regex, EXP_TYPE_OSREGEX);
+    *state = st;
+    return 0;
+}
+
+static int teardown_file_contents(void **state) {
+    file_contents_state_t * st = *state;
+
+    unlink(st->regular);
+    unlink(st->fifo);
+    rmdir(st->dir);
+    w_free_expression_t(&st->regex);
+    os_free(st->reason);
+    os_free(st);
+    return 0;
+}
+
+void test_wm_sca_check_file_contents_regular_file_match(void **state) {
+    file_contents_state_t * st = *state;
+
+    expect_string(__wrap_realpath, path, "/etc/policy_target");
+    will_return(__wrap_realpath, st->regular);
+
+    assert_int_equal(wm_sca_check_file_contents("/etc/policy_target", "second line", &st->reason, st->regex), 1);
+    assert_null(st->reason);
+}
+
+void test_wm_sca_check_file_contents_regular_file_no_match(void **state) {
+    file_contents_state_t * st = *state;
+
+    expect_string(__wrap_realpath, path, "/etc/policy_target");
+    will_return(__wrap_realpath, st->regular);
+
+    assert_int_equal(wm_sca_check_file_contents("/etc/policy_target", "third line", &st->reason, st->regex), 0);
+    assert_null(st->reason);
+}
+
+void test_wm_sca_check_file_contents_fifo(void **state) {
+    file_contents_state_t * st = *state;
+
+    // No writer is ever attached: a blocking open would never return.
+    expect_string(__wrap_realpath, path, "/etc/policy_target");
+    will_return(__wrap_realpath, st->fifo);
+
+    assert_int_equal(wm_sca_check_file_contents("/etc/policy_target", "second line", &st->reason, st->regex), 2);
+    assert_string_equal(st->reason, "Could not open file '/etc/policy_target': Not a regular file");
+}
+
+void test_wm_sca_check_file_contents_character_device(void **state) {
+    file_contents_state_t * st = *state;
+
+    // An endless device would keep the read loop from ever reaching end of file.
+    expect_string(__wrap_realpath, path, "/etc/policy_target");
+    will_return(__wrap_realpath, "/dev/zero");
+
+    assert_int_equal(wm_sca_check_file_contents("/etc/policy_target", "second line", &st->reason, st->regex), 2);
+    assert_string_equal(st->reason, "Could not open file '/etc/policy_target': Not a regular file");
+}
+
+void test_wm_sca_check_file_contents_directory(void **state) {
+    file_contents_state_t * st = *state;
+
+    expect_string(__wrap_realpath, path, "/etc/policy_target");
+    will_return(__wrap_realpath, st->dir);
+
+    assert_int_equal(wm_sca_check_file_contents("/etc/policy_target", "second line", &st->reason, st->regex), 2);
+    assert_string_equal(st->reason, "Could not open file '/etc/policy_target': Not a regular file");
+}
+
+void test_wm_sca_check_file_contents_open_error(void **state) {
+    file_contents_state_t * st = *state;
+
+    expect_string(__wrap_realpath, path, "/etc/policy_target");
+    will_return(__wrap_realpath, st->missing);
+
+    assert_int_equal(wm_sca_check_file_contents("/etc/policy_target", "second line", &st->reason, st->regex), 2);
+    assert_string_equal(st->reason, "Could not open file '/etc/policy_target': No such file or directory");
+}
+
+void test_wm_sca_check_file_contents_path_not_resolved(void **state) {
+    file_contents_state_t * st = *state;
+
+    expect_string(__wrap_realpath, path, "/etc/policy_target");
+    will_return(__wrap_realpath, NULL);
+
+    assert_int_equal(wm_sca_check_file_contents("/etc/policy_target", "second line", &st->reason, st->regex), 2);
+    assert_non_null(st->reason);
+}
+
 /* main */
 
 int main(void) {
@@ -786,6 +1031,10 @@ int main(void) {
         cmocka_unit_test_setup_teardown(test_read_scheduling_weekday_configuration, setup_test_read, teardown_test_read),
         cmocka_unit_test_setup_teardown(test_read_scheduling_daytime_configuration, setup_test_read, teardown_test_read),
         cmocka_unit_test_setup_teardown(test_read_scheduling_interval_configuration, setup_test_read, teardown_test_read),
+        cmocka_unit_test_setup_teardown(test_wm_sca_policy_remote_agent_conf_outside_ruleset, setup_test_read, teardown_test_read),
+        cmocka_unit_test_setup_teardown(test_wm_sca_policy_remote_agent_conf_path_contains_ruleset_substring, setup_test_read, teardown_test_read),
+        cmocka_unit_test_setup_teardown(test_wm_sca_policy_local_agent_conf_inside_ruleset, setup_test_read, teardown_test_read),
+        cmocka_unit_test_setup_teardown(test_wm_sca_policy_local_ossec_conf_outside_ruleset, setup_test_read, teardown_test_read),
         cmocka_unit_test(test_wm_sort_variables_null),
         cmocka_unit_test(test_wm_sort_variables_duplicated),
         cmocka_unit_test(test_wm_sort_variables),
@@ -819,7 +1068,14 @@ int main(void) {
         cmocka_unit_test(test_wm_sca_apply_numeric_partial_comparison_no_capture_number_with_reason_null),
         cmocka_unit_test(test_wm_sca_apply_numeric_partial_comparison_no_capture_number_with_reason_not_null),
         cmocka_unit_test(test_wm_sca_apply_numeric_partial_comparison_no_operation_supported_with_reason_null),
-        cmocka_unit_test(test_wm_sca_apply_numeric_partial_comparison_no_operation_supported_with_reason_not_null)
+        cmocka_unit_test(test_wm_sca_apply_numeric_partial_comparison_no_operation_supported_with_reason_not_null),
+        cmocka_unit_test_setup_teardown(test_wm_sca_check_file_contents_regular_file_match, setup_file_contents, teardown_file_contents),
+        cmocka_unit_test_setup_teardown(test_wm_sca_check_file_contents_regular_file_no_match, setup_file_contents, teardown_file_contents),
+        cmocka_unit_test_setup_teardown(test_wm_sca_check_file_contents_fifo, setup_file_contents, teardown_file_contents),
+        cmocka_unit_test_setup_teardown(test_wm_sca_check_file_contents_character_device, setup_file_contents, teardown_file_contents),
+        cmocka_unit_test_setup_teardown(test_wm_sca_check_file_contents_directory, setup_file_contents, teardown_file_contents),
+        cmocka_unit_test_setup_teardown(test_wm_sca_check_file_contents_open_error, setup_file_contents, teardown_file_contents),
+        cmocka_unit_test_setup_teardown(test_wm_sca_check_file_contents_path_not_resolved, setup_file_contents, teardown_file_contents)
     };
     int result;
     result = cmocka_run_group_tests(tests_with_startup, setup_module, teardown_module);

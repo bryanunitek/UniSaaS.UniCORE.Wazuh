@@ -45,7 +45,17 @@ char *get_agent_ip()
     char agent_ip[IPSIZE + 1] = { '\0' };
     struct sockaddr_storage sas;
     socklen_t len = sizeof(sas);
-    const int err = getsockname(agt->sock, (struct sockaddr *)&sas, &len);
+    int err;
+
+    /* Under send_mutex so a sender thread can't invalidate agt->sock between
+     * reading it and using it here (the same reasoning as every other socket
+     * access this fix already guards this way). Worst case without this is a
+     * getsockname(-1, ...) failure and a blank agent IP for one keep-alive
+     * cycle, self-recovering the next one -- still worth closing since the
+     * fix is a two-line change and the pattern should be consistent. */
+    send_mutex_lock();
+    err = getsockname(atomic_int_get(&agt->sock), (struct sockaddr *)&sas, &len);
+    send_mutex_unlock();
 
     if (!err) {
         switch (sas.ss_family) {
@@ -75,6 +85,12 @@ void clear_merged_hash_cache() {
     os_free(g_shared_mg_file_hash);
 }
 
+#ifdef WAZUH_UNIT_TESTING
+void notify_reset_saved_time(void) {
+    g_saved_time = 0;
+}
+#endif
+
 /* Periodically send notification to server */
 void run_notify()
 {
@@ -88,22 +104,20 @@ void run_notify()
     static const char no_hash_value[] = "x merged.mg\n";
 
     tmp_msg[OS_MAXSTR - OS_HEADER_SIZE + 1] = '\0';
+    time_t mono_now = w_get_monotonic_time();
     curr_time = time(0);
+
+    if (g_saved_time == 0) {
+        g_saved_time = mono_now;
+    }
 
 #ifndef ONEWAY_ENABLED
     /* Check if the server has responded */
     if ((curr_time - available_server) > agt->max_time_reconnect_try) {
         /* If response is not available, set lock and wait for it */
         mwarn(SERVER_UNAV);
-        os_setwait();
-        w_agentd_state_update(UPDATE_STATUS, (void *) GA_STATUS_NACTIVE);
-
-        /* Send sync message */
-        start_agent(0);
-
+        reconnect_to_server();
         minfo(SERVER_UP);
-        os_delwait();
-        w_agentd_state_update(UPDATE_STATUS, (void *) GA_STATUS_ACTIVE);
     }
 #endif
 
@@ -111,21 +125,14 @@ void run_notify()
     if (agt->force_reconnect_interval && (curr_time - last_connection_time) >= agt->force_reconnect_interval) {
         /* Set lock and wait for it */
         minfo("Wazuh Agent will be reconnected because of force reconnect interval");
-        os_setwait();
-        w_agentd_state_update(UPDATE_STATUS, (void *) GA_STATUS_NACTIVE);
-
-        /* Send sync message */
-        start_agent(0);
-
-        os_delwait();
-        w_agentd_state_update(UPDATE_STATUS, (void *) GA_STATUS_ACTIVE);
+        reconnect_to_server();
     }
 
-    /* Check if time has elapsed */
-    if ((curr_time - g_saved_time) < agt->notify_time) {
+    /* Check if time has elapsed (monotonic — immune to clock changes) */
+    if ((mono_now - g_saved_time) < agt->notify_time) {
         return;
     }
-    g_saved_time = curr_time;
+    g_saved_time = mono_now;
 
     mdebug1("Sending agent notification.");
 
@@ -161,10 +168,8 @@ void run_notify()
         clear_merged_hash_cache();
     }
 
-    time_t now = time(NULL);
-    if ((now - last_update) >= agt->main_ip_update_interval) {
-        // Update agent_ip considering main_ip_update_interval value
-        last_update = now;
+    if ((mono_now - last_update) >= agt->main_ip_update_interval) {
+        last_update = mono_now;
         char *tmp_agent_ip = get_agent_ip();
 
         if (tmp_agent_ip) {

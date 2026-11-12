@@ -21,9 +21,6 @@
 #define CONTINUE_ENTRY  "continue"
 #define ABORT_ENTRY     "abort"
 
-/* Maximum number of active responses active */
-#define MAX_AR      64
-
 /* Maximum number of command arguments */
 #define MAX_ARGS    32
 
@@ -39,11 +36,13 @@ extern int max_restart_lock;
 /** Function prototypes **/
 
 int ReadExecConfig(void);
+void FreeExecConfig(void);
 cJSON *getARConfig(void);
 cJSON *getExecdInternalOptions(void);
 cJSON *getClusterConfig(void);
 char *GetCommandbyName(const char *name, int *timeout) __attribute__((nonnull));
 void ExecCmd(char *const *cmd) __attribute__((nonnull));
+void ExecdLogRestart(char *const *cmd) __attribute__((nonnull));
 void ExecCmd_Win32(char *cmd);
 int ExecdConfig(const char *cfgfile) __attribute__((nonnull));
 

@@ -32,12 +32,14 @@ include(${SRC_FOLDER}/unit_tests/wrappers/wazuh/shared/shared.cmake)
 # Generate agentd tests
 list(APPEND client-agent_names "test_start_agent")
 set(START_AGENT_BASE_FLAGS "-Wl,--wrap,w_rotate_log -Wl,--wrap,getDefine_Int -Wl,--wrap,OS_ConnectUDP \
+                            -Wl,--wrap,OS_SetKeepalive -Wl,--wrap,OS_SetKeepalive_Options -Wl,--wrap,OS_SetSendTimeout \
                             -Wl,--wrap,OS_ConnectTCP -Wl,--wrap,OS_SetRecvTimeout -Wl,--wrap,OS_GetHost \
                             -Wl,--wrap,send_msg -Wl,--wrap,recv -Wl,--wrap,OS_RecvSecureTCP -Wl,--wrap,fseek \
                             -Wl,--wrap=is_fim_shutdown -Wl,--wrap=fim_db_teardown \
                             -Wl,--wrap=_imp__dbsync_initialize -Wl,--wrap=_imp__rsync_initialize \
                             -Wl,--wrap,fprintf -Wl,--wrap,fflush -Wl,--wrap,ReadSecMSG -Wl,--wrap,wnet_select \
                             -Wl,--wrap,OS_SendSecureTCP -Wl,--wrap,OS_SendUDPbySize -Wl,--wrap,getpid ${DEBUG_OP_WRAPPERS} \
+                            -Wl,--wrap,OS_RecvSecureTCPTimeout -Wl,--wrap,OS_SendSecureTCPTimeout \
                             -Wl,--wrap,w_calloc_expression_t -Wl,--wrap,w_expression_compile -Wl,--wrap,w_expression_match \
                             -Wl,--wrap,w_free_expression_t -Wl,--wrap,OS_CloseSocket")
 if(${TARGET} STREQUAL "winagent")
@@ -53,11 +55,13 @@ list(APPEND client-agent_flags "-Wl,--wrap,control_check_connection,--wrap,OS_Se
                                 -Wl,--wrap=is_fim_shutdown -Wl,--wrap=fim_db_teardown \
                                 -Wl,--wrap=_imp__dbsync_initialize -Wl,--wrap=_imp__rsync_initialize \
                                 -Wl,--wrap=getsockname -Wl,--wrap,get_ipv4_string -Wl,--wrap,get_ipv6_string \
-                                -Wl,--wrap,sleep,--wrap,w_rotate_log,--wrap,getpid,--wrap,time ${DEBUG_OP_WRAPPERS}")
+                                -Wl,--wrap,sleep,--wrap,w_rotate_log,--wrap,getpid,--wrap,time ${DEBUG_OP_WRAPPERS} \
+                                -Wl,--wrap,w_get_monotonic_time,--wrap,send_msg,--wrap,w_agentd_state_update")
 else()
 list(APPEND client-agent_flags "-Wl,--wrap,control_check_connection,--wrap,OS_SendUnix,--wrap,OS_RecvUnix \
                                 -Wl,--wrap=getsockname -Wl,--wrap,get_ipv4_string -Wl,--wrap,get_ipv6_string \
-                                -Wl,--wrap,sleep,--wrap,w_rotate_log,--wrap,getpid,--wrap,time ${DEBUG_OP_WRAPPERS}")
+                                -Wl,--wrap,sleep,--wrap,w_rotate_log,--wrap,getpid,--wrap,time ${DEBUG_OP_WRAPPERS} \
+                                -Wl,--wrap,w_get_monotonic_time,--wrap,send_msg,--wrap,w_agentd_state_update")
 endif()
 
 list(APPEND client-agent_names "test_agentd_state")
@@ -105,8 +109,23 @@ list(APPEND client-agent_flags "-Wl,--wrap,getClientConfig -Wl,--wrap,getBufferC
 endif()
 
 if(${TARGET} STREQUAL "agent")
+list(APPEND client-agent_names "test_receiver")
+list(APPEND client-agent_flags "-Wl,--wrap,OS_RecvSecureTCPTimeout,--wrap,ReadSecMSG,--wrap,wfopen \
+                                -Wl,--wrap,OS_MD5_File,--wrap,UnmergeFiles,--wrap,cldir_ex_ignore,--wrap,rename_ex,--wrap,unlink \
+                                -Wl,--wrap,clear_merged_hash_cache,--wrap,verifyRemoteConf,--wrap,reloadAgent \
+                                -Wl,--wrap,send_msg,--wrap,w_agentd_state_update ${DEBUG_OP_WRAPPERS}")
+
 list(APPEND client-agent_names "test_agentd")
-list(APPEND client-agent_flags "-Wl,--wrap,wurl_free_response -Wl,--wrap,wurl_http_request ${DEBUG_OP_WRAPPERS}")
+list(APPEND client-agent_flags "-Wl,--wrap,wurl_free_response -Wl,--wrap,wurl_http_request -Wl,--wrap,getDefine_Int -Wl,--wrap,os_read_agent_profile ${DEBUG_OP_WRAPPERS}")
+
+list(APPEND client-agent_names "test_sendmsg")
+list(APPEND client-agent_flags "${DEBUG_OP_WRAPPERS} \
+                                -Wl,--wrap,CreateSecMSG -Wl,--wrap,sleep -Wl,--wrap,getpid -Wl,--wrap,w_agentd_state_update \
+                                -Wl,--wrap,OS_SendSecureTCP -Wl,--wrap,OS_SendSecureTCPTimeout -Wl,--wrap,OS_SendUDPbySize -Wl,--wrap,OS_CloseSocket")
+
+list(APPEND client-agent_names "test_rotate_log")
+list(APPEND client-agent_flags "${DEBUG_OP_WRAPPERS} -Wl,--wrap,time -Wl,--wrap,IsDir -Wl,--wrap,IsFile -Wl,--wrap,FileSize \
+                                -Wl,--wrap,rename_ex -Wl,--wrap,wfopen -Wl,--wrap,OS_CompressLog -Wl,--wrap,wopendir")
 endif()
 
 list(LENGTH client-agent_names count)

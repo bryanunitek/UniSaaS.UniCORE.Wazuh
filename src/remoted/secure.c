@@ -43,7 +43,7 @@ OSHash *remoted_agents_state;
 extern remoted_state_t remoted_state;
 ROUTER_PROVIDER_HANDLE router_rsync_handle = NULL;
 ROUTER_PROVIDER_HANDLE router_syscollector_handle = NULL;
-// ROUTER_PROVIDER_HANDLE router_syscheck_handle = NULL; // DISABLED 
+// ROUTER_PROVIDER_HANDLE router_syscheck_handle = NULL; // DISABLED
 STATIC void handle_outgoing_data_to_tcp_socket(int sock_client);
 STATIC void handle_incoming_data_from_tcp_socket(int sock_client);
 STATIC void handle_incoming_data_from_udp_socket(struct sockaddr_storage * peer_info);
@@ -285,6 +285,23 @@ void HandleSecure()
         merror_exit(QUEUE_FATAL, DEFAULTQUEUE);
     }
 
+    /* Start up message - emitted after queue connection so the service is truly operational */
+    {
+        const int _pos = logr.position;
+        char *_protocol = NULL;
+        if (logr.proto[_pos] & REMOTED_NET_PROTOCOL_TCP) {
+            wm_strcat(&_protocol, REMOTED_NET_PROTOCOL_TCP_STR, 0);
+        }
+        if (logr.proto[_pos] & REMOTED_NET_PROTOCOL_UDP) {
+            wm_strcat(&_protocol, REMOTED_NET_PROTOCOL_UDP_STR, _protocol ? ',' : 0);
+        }
+        minfo(STARTUP_MSG " Listening on port %d/%s (secure).",
+            (int)getpid(),
+            logr.port[_pos],
+            _protocol ? _protocol : "unknown");
+        os_free(_protocol);
+    }
+
     /* Read authentication keys */
     minfo(ENC_READ);
 
@@ -371,10 +388,12 @@ STATIC void handle_new_tcp_connection(wnotify_t * notify, struct sockaddr_storag
     int sock_client = accept(logr.tcp_sock, (struct sockaddr *) peer_info, &logr.peer_size);
 
     if (sock_client >= 0) {
+        // Count before the slot exists, so no association can decrement first
+        rem_inc_tcp();
+        rem_inc_tcp_unassociated();
+
         nb_open(&netbuffer_recv, sock_client, peer_info);
         nb_open(&netbuffer_send, sock_client, peer_info);
-
-        rem_inc_tcp();
 
         mdebug1("New TCP connection [%d]", sock_client);
 
@@ -776,6 +795,23 @@ STATIC void HandleSecureMessage(const message_t *message, w_indexed_queue_t * co
         return;
     }
 
+    if (msg_length > OS_MAXSTR) {
+        mwarn("Message length (%zu) exceeds maximum allowed size (%d) from agent '%s'",
+              msg_length, OS_MAXSTR, keys.keyentries[agentid]->id);
+        key_unlock();
+
+        if (message->sock >= 0) {
+            _close_sock(&keys, message->sock);
+        }
+
+        if (sock_idle >= 0) {
+            _close_sock(&keys, sock_idle);
+        }
+
+        rem_inc_recv_unknown();
+        return;
+    }
+
     /* Recieved valid message timestamp updated. */
     keys.keyentries[agentid]->rcvd = current_ts;
 
@@ -815,6 +851,11 @@ STATIC void HandleSecureMessage(const message_t *message, w_indexed_queue_t * co
                     default:
                         ;
                     }
+
+                    // Only the first association of a live socket leaves the unassociated count
+                    if (r != OS_ADDSOCKET_ERROR && nb_mark_associated(&netbuffer_recv, message->sock, message->counter)) {
+                        rem_dec_tcp_unassociated();
+                    }
                 }
             } else {
                 keys.keyentries[agentid]->sock = USING_UDP_NO_CLIENT_SOCKET;
@@ -852,7 +893,8 @@ STATIC void HandleSecureMessage(const message_t *message, w_indexed_queue_t * co
 
                 os_calloc(msg_length, sizeof(char), ctrl_msg_data->message);
                 // Use cleaned message from validation if available, otherwise use original
-                memcpy(ctrl_msg_data->message, cleaned_msg ? cleaned_msg : tmp_msg, tmp_msg_length);
+                const char * src_msg = cleaned_msg ? cleaned_msg : tmp_msg;
+                memcpy(ctrl_msg_data->message, src_msg, strnlen(src_msg, tmp_msg_length));
 
                 // Store validation results in the control message data structure
                 ctrl_msg_data->is_startup = is_startup;
@@ -905,6 +947,12 @@ STATIC void HandleSecureMessage(const message_t *message, w_indexed_queue_t * co
     os_strdup(keys.keyentries[agentid]->ip->ip, agent_ip);
 
     key_unlock();
+
+    /* Agents registered without a fixed address use "any"; fall back to the real connection IP. */
+    if (strcmp(agent_ip, "any") == 0 && srcip[0] != '\0') {
+        os_free(agent_ip);
+        os_strdup(srcip, agent_ip);
+    }
 
     if (sock_idle >= 0) {
         _close_sock(&keys, sock_idle);
@@ -1022,6 +1070,7 @@ void router_message_forward(char* msg, const char* agent_id, const char* agent_i
 // Close and remove socket from keystore
 int _close_sock(keystore * keys, int sock) {
     int retval = 0;
+    int was_unassociated = 0;
 
     rem_setCounter(sock, global_counter);
 
@@ -1029,9 +1078,12 @@ int _close_sock(keystore * keys, int sock) {
     retval = OS_DeleteSocket(keys, sock);
     key_unlock();
 
-    if (!close(sock)) {
-        nb_close(&netbuffer_recv, sock);
-        nb_close(&netbuffer_send, sock);
+    if (!nb_close_socket(&netbuffer_recv, &netbuffer_send, sock, &was_unassociated)) {
+        // Decrement the subset first so it never exceeds tcp_sessions
+        if (was_unassociated) {
+            rem_dec_tcp_unassociated();
+        }
+
         rem_dec_tcp();
     }
 

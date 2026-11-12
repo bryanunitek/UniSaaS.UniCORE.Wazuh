@@ -12,13 +12,14 @@ import sys
 from wazuh_testing import session_parameters
 from wazuh_testing.constants import platforms
 from wazuh_testing.constants.platforms import WINDOWS
-from wazuh_testing.constants.daemons import WAZUH_MANAGER, API_DAEMONS_REQUIREMENTS
+from wazuh_testing.constants.daemons import WAZUH_MANAGER, API_DAEMONS_REQUIREMENTS, ANALYSISD_DAEMON
 from wazuh_testing.constants.paths import ROOT_PREFIX
 from wazuh_testing.constants.paths.api import RBAC_DATABASE_PATH
 from wazuh_testing.constants.paths.logs import (
     ACTIVE_RESPONSE_LOG_PATH,
     WAZUH_LOG_PATH,
     ALERTS_JSON_PATH,
+    ARCHIVES_LOG_PATH,
     WAZUH_API_LOG_FILE_PATH,
     WAZUH_API_JSON_LOG_FILE_PATH,
 )
@@ -289,6 +290,7 @@ def truncate_monitored_files_implementation() -> None:
         log_files = [
             WAZUH_LOG_PATH,
             ALERTS_JSON_PATH,
+            ARCHIVES_LOG_PATH,
             WAZUH_API_LOG_FILE_PATH,
             WAZUH_API_JSON_LOG_FILE_PATH,
             WAZUH_CLIENT_KEYS_PATH,
@@ -330,6 +332,8 @@ def daemons_handler_implementation(request: pytest.FixtureRequest) -> None:
         all_daemons (boolean): Configure to restart all wazuh services. Default `False`.
         ignore_errors (boolean): Configure if errors in daemon handling should be ignored. This option is available
         in order to use this fixture along with invalid configuration. Default `False`
+        extra_sockets (list, optional): Additional wazuh-analysisd sockets (e.g. LOGTEST_SOCKET_PATH) that are not
+            part of its default socket set but that the module needs ready before proceeding. Default `[]`
 
     Args:
         request (pytest.FixtureRequest): Provide information about the current test function which made the request.
@@ -337,6 +341,7 @@ def daemons_handler_implementation(request: pytest.FixtureRequest) -> None:
     daemons = []
     ignore_errors = False
     all_daemons = False
+    extra_sockets = []
 
     if config := getattr(request.module, "daemons_handler_configuration", None):
         if "daemons" in config:
@@ -352,6 +357,9 @@ def daemons_handler_implementation(request: pytest.FixtureRequest) -> None:
         if "ignore_errors" in config:
             logger.debug(f"Ignore error set to {config['ignore_errors']}")
             ignore_errors = config["ignore_errors"]
+
+        if "extra_sockets" in config:
+            extra_sockets = config["extra_sockets"]
     else:
         logger.debug("Wazuh control set to 'all_daemons'")
         all_daemons = True
@@ -360,11 +368,16 @@ def daemons_handler_implementation(request: pytest.FixtureRequest) -> None:
         if all_daemons:
             logger.debug("Restarting wazuh using wazuh-control")
             services.control_service("restart")
+            services.wait_expected_daemon_status(target_daemon="wazuh-analysisd", running_condition=True,
+                                                extra_sockets=extra_sockets)
         else:
             for daemon in daemons:
                 logger.debug(f"Restarting {daemon}")
                 # Restart daemon instead of starting due to legacy used fixture in the test suite.
                 services.control_service("restart", daemon=daemon)
+                daemon_extra_sockets = extra_sockets if daemon == ANALYSISD_DAEMON else []
+                services.wait_expected_daemon_status(target_daemon=daemon, running_condition=True,
+                                                        extra_sockets=daemon_extra_sockets)
 
     except ValueError as value_error:
         logger.error(f"{str(value_error)}")
@@ -374,6 +387,10 @@ def daemons_handler_implementation(request: pytest.FixtureRequest) -> None:
         logger.error(f"{str(called_process_error)}")
         if not ignore_errors:
             raise called_process_error
+    except TimeoutError as timeout_error:
+        logger.error(f"{str(timeout_error)}")
+        if not ignore_errors:
+            raise timeout_error
 
     yield
 
@@ -495,53 +512,121 @@ def configure_sockets_environment_implementation(
     Args:
         request (pytest.FixtureRequest): Provide information about the current test function which made the request.
     """
+
     monitored_sockets_params = getattr(request.module, "monitored_sockets_params")
 
-    # Stop wazuh-service and ensure all daemons are stopped
-    services.control_service("stop")
-    services.wait_expected_daemon_status(running_condition=False)
-
     monitored_sockets = list()
-    mitm_list = list()
+    started_mitms = list()
+    started_daemons = list()
 
-    # Start selected daemons and monitored sockets MITM
-    for daemon, mitm, daemon_first in monitored_sockets_params:
-        not daemon_first and mitm is not None and mitm.start()
-        services.control_service("start", daemon=daemon, debug_mode=True)
-        services.wait_expected_daemon_status(
-            running_condition=True,
-            target_daemon=daemon,
-            extra_sockets=[mitm.listener_socket_address]
-            if mitm is not None and mitm.family == "AF_UNIX"
-            else [],
-        )
-        daemon_first and mitm is not None and mitm.start()
-        if mitm is not None:
-            monitored_sockets.append(
-                queue_monitor.QueueMonitor(monitored_object=mitm.queue)
+    try:
+        # Stop wazuh-service and ensure all daemons are stopped
+        try:
+            services.control_service("stop")
+        except Exception as e:
+            logger.warning(f"Setup step failed: {e}")
+
+        try:
+            services.wait_expected_daemon_status(running_condition=False)
+        except Exception as e:
+            logger.warning(f"Setup step failed: {e}")
+
+
+        # Clean leftover daemons. Missing files are the expected case when the
+        # previous teardown ran cleanly, so swallow FileNotFoundError silently.
+        for daemon, mitm, daemon_first in monitored_sockets_params:
+            pid_file = f"/var/ossec/var/run/{daemon}.pid"
+            try:
+                os.unlink(pid_file)
+            except FileNotFoundError:
+                pass
+
+            if mitm is not None and mitm.family == "AF_UNIX":
+                try:
+                    os.unlink(mitm.listener_socket_address)
+                except FileNotFoundError:
+                    pass
+
+                try:
+                    os.unlink(f"{mitm.listener_socket_address}.original")
+                except FileNotFoundError:
+                    pass
+
+                mitm.event.clear()
+
+        # Start selected daemons and monitored sockets MITM
+        for daemon, mitm, daemon_first in monitored_sockets_params:
+            if not daemon_first and mitm is not None:
+                mitm.start()
+                started_mitms.append(mitm)
+
+            services.control_service("start", daemon=daemon, debug_mode=True)
+            started_daemons.append(daemon)
+
+            # Use a 60s timeout (vs the framework default of 10s) because
+            # test_authd_key_request_worker has been observed to need >30s for
+            # wazuh-authd to publish its pid file when started right after the
+            # previous module killed wazuh-authd (likely TIME_WAIT on port 1515
+            # or post-fork init taking longer than expected). If the timeout
+            # still hits, the next step is to capture /var/ossec/logs/ossec.log
+            # to see what wazuh-authd is doing after goDaemon().
+            services.wait_expected_daemon_status(
+                target_daemon=daemon,
+                running_condition=True,
+                timeout=60,
+                extra_sockets=[mitm.listener_socket_address]
+                if mitm is not None and mitm.family == "AF_UNIX"
+                else [],
             )
-            mitm_list.append(mitm)
 
-    setattr(request.module, "monitored_sockets", monitored_sockets)
+            if daemon_first and mitm is not None:
+                mitm.start()
+                started_mitms.append(mitm)
 
-    yield
+            if mitm is not None:
+                monitored_sockets.append(
+                    queue_monitor.QueueMonitor(monitored_object=mitm.queue)
+                )
 
-    # Stop daemons and monitored sockets MITM
-    for daemon, mitm, _ in monitored_sockets_params:
-        mitm is not None and mitm.shutdown()
-        services.control_service("stop", daemon=daemon)
-        services.wait_expected_daemon_status(
-            running_condition=False,
-            target_daemon=daemon,
-            extra_sockets=[mitm.listener_socket_address]
-            if mitm is not None and mitm.family == "AF_UNIX"
-            else [],
-        )
+        setattr(request.module, "monitored_sockets", monitored_sockets)
 
-    # Delete all db
-    database.delete_dbs()
+        yield
+    finally:
+        # Stop daemons and monitored sockets MITM
+        for daemon, mitm, _ in monitored_sockets_params:
+            if mitm is not None and mitm in started_mitms:
+                try:
+                    mitm.shutdown()
+                except Exception as e:
+                    logger.warning(f"Cleanup step failed: {e}")
 
-    services.control_service("start")
+            if daemon in started_daemons:
+                try:
+                    services.control_service("stop", daemon=daemon)
+                except Exception as e:
+                    logger.warning(f"Cleanup step failed: {e}")
+
+                try:
+                    services.wait_expected_daemon_status(
+                        running_condition=False,
+                        target_daemon=daemon,
+                        extra_sockets=[mitm.listener_socket_address]
+                        if mitm is not None and mitm.family == "AF_UNIX"
+                        else [],
+                    )
+                except Exception as e:
+                    logger.warning(f"Cleanup step failed: {e}")
+
+        # Delete all db
+        try:
+            database.delete_dbs()
+        except Exception as e:
+            logger.warning(f"Cleanup step failed: {e}")
+
+        try:
+            services.control_service("start")
+        except Exception as e:
+            logger.warning(f"Cleanup step failed: {e}")
 
 
 @pytest.fixture(scope="module")

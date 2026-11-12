@@ -79,6 +79,8 @@ int initialize_syscheck_configuration(syscheck_config *syscheck) {
     syscheck->nodiff_regex                    = NULL;
     syscheck->scan_day                        = NULL;
     syscheck->scan_time                       = NULL;
+    syscheck->scan_day_str                    = NULL;
+    syscheck->scan_time_str                   = NULL;
     syscheck->file_limit_enabled              = true;
     syscheck->file_entry_limit                = 100000;
     syscheck->directories                     = OSList_Create();
@@ -1300,9 +1302,13 @@ int read_data_unit(const char *content) {
     int read_value = 0;
     char *value_str;
 
+    if (len_value_str == 0) {
+        return -1;
+    }
+
     // Check that the last character is a 'B' or a 'b', if it is, translate data unit
     // Else, use written value as KB
-    if (content[len_value_str - 1] == 'B' || content[len_value_str - 1] == 'b') {
+    if (len_value_str > 1 && (content[len_value_str - 1] == 'B' || content[len_value_str - 1] == 'b')) {
         if (isalpha(content[len_value_str - 2])){
             os_calloc(len_value_str, sizeof(char), value_str);
             memcpy(value_str, content, len_value_str - 2);
@@ -1763,6 +1769,7 @@ int Read_Syscheck(const OS_XML *xml, XML_NODE node, void *configp, __attribute__
                 mwarn(XML_VALUEERR, node[i]->element, node[i]->content);
                 return (OS_INVALID);
             }
+            os_strdup(node[i]->content, syscheck->scan_time_str);
         }
 
         /* Get scan day */
@@ -1773,6 +1780,7 @@ int Read_Syscheck(const OS_XML *xml, XML_NODE node, void *configp, __attribute__
                 mwarn(XML_VALUEERR, node[i]->element, node[i]->content);
                 return (OS_INVALID);
             }
+            os_strdup(node[i]->content, syscheck->scan_day_str);
         }
 
         /* Get file limit */
@@ -2122,6 +2130,7 @@ int Read_Syscheck(const OS_XML *xml, XML_NODE node, void *configp, __attribute__
                         OS_ClearNode(children);
                         return(OS_INVALID);
                     }
+#ifndef WIN32
                 } else if (strcmp(children[j]->element, xml_provider) == 0) {
                     if(strcmp(children[j]->content, "ebpf") == 0)
                         syscheck->whodata_provider = EBPF_PROVIDER;
@@ -2133,7 +2142,6 @@ int Read_Syscheck(const OS_XML *xml, XML_NODE node, void *configp, __attribute__
                         OS_ClearNode(children);
                         return(OS_INVALID);
                     }
-#ifndef WIN32
                 } else if (strcmp(children[j]->element, xml_queue_size) == 0) {
                     char * end;
                     long value = strtol(children[j]->content, &end, 10);
@@ -2146,6 +2154,9 @@ int Read_Syscheck(const OS_XML *xml, XML_NODE node, void *configp, __attribute__
                     else {
                         syscheck->queue_size = value;
                     }
+#else
+                } else if (strcmp(children[j]->element, xml_provider) == 0) {
+                    mwarn(FIM_WARN_WHODATA_PROVIDER_UNSUPPORTED);
 #endif
                 } else {
                     mwarn(XML_ELEMNULL);
@@ -2369,8 +2380,14 @@ void Free_Syscheck(syscheck_config * config) {
         if (config->scan_day) {
             free(config->scan_day);
         }
+        if (config->scan_day_str) {
+            free(config->scan_day_str);
+        }
         if (config->scan_time) {
             free(config->scan_time);
+        }
+        if (config->scan_time_str) {
+            free(config->scan_time_str);
         }
         if (config->ignore) {
             for (i=0; config->ignore[i] != NULL; i++) {

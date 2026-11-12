@@ -203,6 +203,7 @@ int parse_agent_update_msg (char *msg,
             // The _agent_ip will not be appended to the labels string.
             // Instead it will be returned in the agent_ip parameter.
             if (!strncmp(line, agent_ip_label, strlen(agent_ip_label))) {
+                os_free(agent_data->agent_ip);
                 os_strdup(line + strlen(agent_ip_label), agent_data->agent_ip);
             }
             else {
@@ -216,6 +217,10 @@ int parse_agent_update_msg (char *msg,
                 *str_tmp = '\0';
                 str_tmp += 3;
 
+                if (agent_data->osd) {
+                    continue;
+                }
+
                 os_calloc(1, sizeof(os_data), agent_data->osd);
                 parse_uname_string(line, agent_data->osd);
                 os_strdup(line, agent_data->osd->os_uname);
@@ -224,8 +229,12 @@ int parse_agent_update_msg (char *msg,
                 if (str_tmp = strstr(line, " / "), str_tmp) {
                     *str_tmp = '\0';
                     str_tmp += 3;
-                    os_strdup(line, agent_data->version);
-                    os_strdup(str_tmp, agent_data->config_sum);
+                    if (*line) {
+                        os_strdup(line, agent_data->version);
+                    }
+                    if (*str_tmp) {
+                        os_strdup(str_tmp, agent_data->config_sum);
+                    }
                 }
                 else if (str_tmp = strstr(line, __ossec_name), str_tmp) {
                     // If for some reason the separator between Wazuh version and config sum is
@@ -240,6 +249,7 @@ int parse_agent_update_msg (char *msg,
                 str_tmp++;
 
                 if (strncmp(str_tmp, SHAREDCFG_FILENAME, strlen(SHAREDCFG_FILENAME)-1) == 0) {
+                    os_free(agent_data->merged_sum);
                     os_strdup(line, agent_data->merged_sum);
                 }
             }

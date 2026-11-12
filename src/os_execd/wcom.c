@@ -123,7 +123,7 @@ size_t wcom_unmerge(const char *file_path, char ** output) {
         return strlen(*output);
     }
 
-    if (UnmergeFiles(final_path, INCOMING_DIR, OS_BINARY, NULL) == 0) {
+    if (UnmergeFiles(final_path, INCOMING_DIR, OS_BINARY, NULL) != UNMERGE_COMPLETE) {
         merror("At WCOM unmerge: Error unmerging file '%s.'", final_path);
         os_strdup("err Cannot unmerge file", *output);
         return strlen(*output);
@@ -153,15 +153,31 @@ size_t wcom_uncompress(const char * source, const char * target, char ** output)
         return strlen(*output);
     }
 
-    if (fsource = gzopen(final_source, "rb"), !fsource) {
-        merror("At WCOM uncompress: Unable to open '%s'", final_source);
+    // Not gzopen(): a symlink left at final_source would be followed, disclosing whatever it points to.
+    if (fsource = w_gzopen_nofollow(INCOMING_DIR, source, "rb"), !fsource) {
+        const int open_errno = errno;
+        if (open_errno == ELOOP) {
+            merror("At WCOM uncompress: Refused to open '%s': the path is a symbolic link", final_source);
+        } else {
+            merror("At WCOM uncompress: Unable to open '%s'", final_source);
+        }
         os_strdup("err Unable to open source", *output);
         return strlen(*output);
     }
 
-    if (ftarget = wfopen(final_target, "wb"), !ftarget) {
+    // Not wfopen(): a symlink left at final_target would be followed, truncating its target.
+    if (ftarget = w_fopen_nofollow(INCOMING_DIR, target, "wb"), !ftarget) {
+        // Saved before gzclose(): the close() and free() it performs internally are free to clobber
+        // errno, which would silently downgrade the message below to the generic one.
+        const int open_errno = errno;
         gzclose(fsource);
-        merror("At WCOM uncompress: Unable to open '%s'", final_target);
+        // Same reasoning as in the upgrade module: strerror() has no useful text for ELOOP on Windows,
+        // so the one failure worth alerting on gets its own message.
+        if (open_errno == ELOOP) {
+            merror("At WCOM uncompress: Refused to open '%s': the path is a symbolic link", final_target);
+        } else {
+            merror("At WCOM uncompress: Unable to open '%s'", final_target);
+        }
         os_strdup("err Unable to open target", *output);
         return strlen(*output);
     }
@@ -202,6 +218,7 @@ size_t wcom_restart(char ** output) {
 #else
             exec_cmd[1] = "manager";
 #endif
+            ExecdLogRestart(exec_cmd);
         } else {
             exec_cmd[0] = "bin/wazuh-control";
             exec_cmd[1] = "restart";
@@ -260,6 +277,7 @@ size_t wcom_reload(char ** output) {
             exec_cmd[1] = "manager";
 #endif
             exec_cmd[2] = "reload";
+            ExecdLogRestart(exec_cmd);
         } else {
             exec_cmd[0] = "bin/wazuh-control";
             exec_cmd[1] = "reload";
@@ -384,7 +402,7 @@ size_t wcom_check_manager_config(char **output) {
                                     "bin/wazuh-execd", "bin/wazuh-analysisd", "bin/wazuh-logcollector",
                                     "bin/wazuh-integratord", "bin/wazuh-syscheckd", "bin/wazuh-maild",
                                     "bin/wazuh-modulesd", "bin/wazuh-clusterd", "bin/wazuh-agentlessd",
-                                    "bin/wazuh-integratord", "bin/wazuh-dbd", "bin/wazuh-csyslogd", NULL
+                                    "bin/wazuh-integratord", "bin/wazuh-csyslogd", NULL
                                     };
 
     int response_retval = 0;
@@ -536,7 +554,10 @@ void * wcom_main(__attribute__((unused)) void * arg) {
 
 int _jailfile(char finalpath[PATH_MAX + 1], const char * basedir, const char * filename) {
 
-    if (w_ref_parent_folder(filename)) {
+    // A bare file name is all that is ever legitimate here. Rejecting separators also keeps the
+    // directory-relative open in w_fopen_nofollow() confined to basedir, since a separator-containing
+    // or absolute name would otherwise be resolved ignoring the directory descriptor.
+    if (!w_is_bare_filename(filename)) {
         return -1;
     }
 

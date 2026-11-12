@@ -122,6 +122,32 @@ void test_jailfile_valid_path(void **state) {
 #endif
 }
 
+void test_jailfile_empty_name(void **state) {
+    char finalpath[PATH_MAX + 1];
+
+    int ret = _jailfile(finalpath, TMP_DIR, "");
+    assert_int_equal(ret, -1);
+}
+
+void test_jailfile_current_folder(void **state) {
+    char finalpath[PATH_MAX + 1];
+
+    int ret = _jailfile(finalpath, TMP_DIR, ".");
+    assert_int_equal(ret, -1);
+}
+
+void test_jailfile_path_separator(void **state) {
+    char finalpath[PATH_MAX + 1];
+
+    int ret = _jailfile(finalpath, TMP_DIR, "subfolder/test_filename");
+    assert_int_equal(ret, -1);
+
+#ifdef TEST_WINAGENT
+    ret = _jailfile(finalpath, TMP_DIR, "subfolder\\test_filename");
+    assert_int_equal(ret, -1);
+#endif
+}
+
 void test_unsign_invalid_source_incomming(void **state) {
     char finalpath[PATH_MAX + 1];
     char *source =  *state;
@@ -207,8 +233,9 @@ void test_unsign_wpk_using_fail(void **state) {
 #else
     expect_string(__wrap_w_wpk_unsign, source, "var/incoming/test_filename");
     will_return(__wrap_mkstemp, 8);
-    expect_any(__wrap_chmod, path);
-    will_return(__wrap_chmod, 0);
+    expect_value(__wrap_fchmod, fd, 8);
+    expect_value(__wrap_fchmod, mode, 0640);
+    will_return(__wrap_fchmod, 0);
 
     expect_string(__wrap__mterror, tag, "wazuh-modulesd:agent-upgrade");
     expect_string(__wrap__mterror, formatted_msg, "(8139): At unsign(): Could not unsign package file 'var/incoming/test_filename'");
@@ -231,8 +258,9 @@ void test_unsign_temp_chmod_fail(void **state) {
     will_return(__wrap_w_ref_parent_folder, 0);
 
     will_return(__wrap_mkstemp, 8);
-    expect_any(__wrap_chmod, path);
-    will_return(__wrap_chmod, -1);
+    expect_value(__wrap_fchmod, fd, 8);
+    expect_value(__wrap_fchmod, mode, 0640);
+    will_return(__wrap_fchmod, -1);
 
     expect_any_count(__wrap_unlink, file, 2);
     will_return_count(__wrap_unlink, 0, 2);
@@ -260,8 +288,9 @@ void test_unsign_success(void **state) {
     expect_string(__wrap_w_wpk_unsign, source, "var/incoming/test_filename");
 
     will_return(__wrap_mkstemp, 8);
-    expect_any(__wrap_chmod, path);
-    will_return(__wrap_chmod, 0);
+    expect_value(__wrap_fchmod, fd, 8);
+    expect_value(__wrap_fchmod, mode, 0640);
+    will_return(__wrap_fchmod, 0);
 #endif
     will_return(__wrap_w_wpk_unsign, 0);
     expect_any(__wrap_unlink, file);
@@ -304,30 +333,52 @@ void test_uncompress_invalid_file_len(void **state) {
 void test_uncompress_gzopen_fail(void **state) {
     char merged[PATH_MAX + 1];
     char *package =  *state;
+#ifdef TEST_WINAGENT
+    const char * source = "tmp\\compressed_test";
+#else
+    const char * source = "tmp/compressed_test";
+#endif
 
-    expect_string(__wrap_w_ref_parent_folder, path, package);
-    will_return(__wrap_w_ref_parent_folder, 0);
+    expect_w_gzopen_nofollow(TMP_DIR, "compressed_test", "rb", NULL);
 
-    expect_string(__wrap_gzopen, path, "compressed_test");
-    expect_string(__wrap_gzopen, mode, "rb");
-    will_return(__wrap_gzopen, NULL);
     expect_string(__wrap__mterror, tag, "wazuh-modulesd:agent-upgrade");
-    expect_string(__wrap__mterror, formatted_msg, "(8140): At uncompress(): Unable to open 'compressed_test'");
+#ifdef TEST_WINAGENT
+    expect_string(__wrap__mterror, formatted_msg, "(8140): At uncompress(): Unable to open 'tmp\\compressed_test'");
+#else
+    expect_string(__wrap__mterror, formatted_msg, "(8140): At uncompress(): Unable to open 'tmp/compressed_test'");
+#endif
 
-    int ret = _uncompress("compressed_test", package, merged);
+    int ret = _uncompress(source, package, merged);
     assert_int_equal(ret, -1);
 }
 
 void test_uncompress_fopen_fail(void **state) {
     char merged[PATH_MAX + 1];
     char *package =  *state;
+#ifdef TEST_WINAGENT
+    const char * source = "tmp\\compressed_test";
+#else
+    const char * source = "tmp/compressed_test";
+#endif
 
-    expect_string(__wrap_w_ref_parent_folder, path, package);
-    will_return(__wrap_w_ref_parent_folder, 0);
+    expect_w_gzopen_nofollow(TMP_DIR, "compressed_test", "rb", (gzFile)4);
 
-    expect_string(__wrap_gzopen, path, "compressed_test");
-    expect_string(__wrap_gzopen, mode, "rb");
-    will_return(__wrap_gzopen, 4);
+#ifdef TEST_WINAGENT
+    will_return(wrap_mktemp_s, NULL);
+    expect_w_fopen_nofollow(TMP_DIR, "test_filename.mg.XXXXXX", "wb", NULL);
+#else
+    will_return(__wrap_mkstemp, 8);
+    expect_value(__wrap_fchmod, fd, 8);
+    expect_value(__wrap_fchmod, mode, 0640);
+    will_return(__wrap_fchmod, 0);
+    expect_fdopen(8, "wb", 0);
+
+    expect_any(__wrap_unlink, file);
+    will_return(__wrap_unlink, 0);
+#endif
+
+    expect_value(__wrap_gzclose, file, 4);
+    will_return(__wrap_gzclose, 0);
 
     expect_string(__wrap__mterror, tag, "wazuh-modulesd:agent-upgrade");
 #ifdef TEST_WINAGENT
@@ -335,31 +386,32 @@ void test_uncompress_fopen_fail(void **state) {
 #else
     expect_string(__wrap__mterror, formatted_msg, "(8140): At uncompress(): Unable to open 'tmp/test_filename.mg.XXXXXX'");
 #endif
-    expect_any(__wrap_wfopen, path);
-    expect_string(__wrap_wfopen, mode, "wb");
-    will_return(__wrap_wfopen, 0);
 
-    expect_value(__wrap_gzclose, file, 4);
-    will_return(__wrap_gzclose, 0);
-
-    int ret = _uncompress("compressed_test", package, merged);
+    int ret = _uncompress(source, package, merged);
     assert_int_equal(ret, -1);
 }
 
 void test_uncompress_fwrite_fail(void **state) {
     char merged[PATH_MAX + 1];
     char *package =  *state;
+#ifdef TEST_WINAGENT
+    const char * source = "tmp\\compressed_test";
+#else
+    const char * source = "tmp/compressed_test";
+#endif
 
-    expect_string(__wrap_w_ref_parent_folder, path, package);
-    will_return(__wrap_w_ref_parent_folder, 0);
+    expect_w_gzopen_nofollow(TMP_DIR, "compressed_test", "rb", (gzFile)4);
 
-    expect_string(__wrap_gzopen, path, "compressed_test");
-    expect_string(__wrap_gzopen, mode, "rb");
-    will_return(__wrap_gzopen, 4);
-
-    expect_any(__wrap_wfopen, path);
-    expect_string(__wrap_wfopen, mode, "wb");
-    will_return(__wrap_wfopen, 5);
+#ifdef TEST_WINAGENT
+    will_return(wrap_mktemp_s, NULL);
+    expect_w_fopen_nofollow(TMP_DIR, "test_filename.mg.XXXXXX", "wb", (FILE *)5);
+#else
+    will_return(__wrap_mkstemp, 8);
+    expect_value(__wrap_fchmod, fd, 8);
+    expect_value(__wrap_fchmod, mode, 0640);
+    will_return(__wrap_fchmod, 0);
+    expect_fdopen(8, "wb", (FILE *)5);
+#endif
 
     expect_value(__wrap_gzread, gz_fd, 4);
     will_return(__wrap_gzread, 4);
@@ -377,26 +429,37 @@ void test_uncompress_fwrite_fail(void **state) {
     will_return(__wrap_fclose, 0);
 
     expect_string(__wrap__mterror, tag, "wazuh-modulesd:agent-upgrade");
-    expect_string(__wrap__mterror, formatted_msg, "(8129): At uncompress(): Cannot write on 'compressed_test'");
+#ifdef TEST_WINAGENT
+    expect_string(__wrap__mterror, formatted_msg, "(8129): At uncompress(): Cannot write on 'tmp\\compressed_test'");
+#else
+    expect_string(__wrap__mterror, formatted_msg, "(8129): At uncompress(): Cannot write on 'tmp/compressed_test'");
+#endif
 
-    int ret = _uncompress("compressed_test", package, merged);
+    int ret = _uncompress(source, package, merged);
     assert_int_equal(ret, -1);
 }
 
 void test_uncompress_gzread_fail(void **state) {
     char merged[PATH_MAX + 1];
     char *package =  *state;
+#ifdef TEST_WINAGENT
+    const char * source = "tmp\\compressed_test";
+#else
+    const char * source = "tmp/compressed_test";
+#endif
 
-    expect_string(__wrap_w_ref_parent_folder, path, package);
-    will_return(__wrap_w_ref_parent_folder, 0);
+    expect_w_gzopen_nofollow(TMP_DIR, "compressed_test", "rb", (gzFile)4);
 
-    expect_string(__wrap_gzopen, path, "compressed_test");
-    expect_string(__wrap_gzopen, mode, "rb");
-    will_return(__wrap_gzopen, 4);
-
-    expect_any(__wrap_wfopen, path);
-    expect_string(__wrap_wfopen, mode, "wb");
-    will_return(__wrap_wfopen, 5);
+#ifdef TEST_WINAGENT
+    will_return(wrap_mktemp_s, NULL);
+    expect_w_fopen_nofollow(TMP_DIR, "test_filename.mg.XXXXXX", "wb", (FILE *)5);
+#else
+    will_return(__wrap_mkstemp, 8);
+    expect_value(__wrap_fchmod, fd, 8);
+    expect_value(__wrap_fchmod, mode, 0640);
+    will_return(__wrap_fchmod, 0);
+    expect_fdopen(8, "wb", (FILE *)5);
+#endif
 
     expect_value(__wrap_gzread, gz_fd, 4);
     will_return(__wrap_gzread, -1);
@@ -411,26 +474,37 @@ void test_uncompress_gzread_fail(void **state) {
     will_return(__wrap_unlink, 0);
 
     expect_string(__wrap__mterror, tag, "wazuh-modulesd:agent-upgrade");
-    expect_string(__wrap__mterror, formatted_msg, "(8141): At uncompress(): Unable to read 'compressed_test'");
+#ifdef TEST_WINAGENT
+    expect_string(__wrap__mterror, formatted_msg, "(8141): At uncompress(): Unable to read 'tmp\\compressed_test'");
+#else
+    expect_string(__wrap__mterror, formatted_msg, "(8141): At uncompress(): Unable to read 'tmp/compressed_test'");
+#endif
 
-    int ret = _uncompress("compressed_test", package, merged);
+    int ret = _uncompress(source, package, merged);
     assert_int_equal(ret, -1);
 }
 
 void test_uncompress_success(void **state) {
     char merged[PATH_MAX + 1];
     char *package =  *state;
+#ifdef TEST_WINAGENT
+    const char * source = "tmp\\compressed_test";
+#else
+    const char * source = "tmp/compressed_test";
+#endif
 
-    expect_string(__wrap_w_ref_parent_folder, path, package);
-    will_return(__wrap_w_ref_parent_folder, 0);
+    expect_w_gzopen_nofollow(TMP_DIR, "compressed_test", "rb", (gzFile)4);
 
-    expect_string(__wrap_gzopen, path, "compressed_test");
-    expect_string(__wrap_gzopen, mode, "rb");
-    will_return(__wrap_gzopen, 4);
-
-    expect_any(__wrap_wfopen, path);
-    expect_string(__wrap_wfopen, mode, "wb");
-    will_return(__wrap_wfopen, 5);
+#ifdef TEST_WINAGENT
+    will_return(wrap_mktemp_s, NULL);
+    expect_w_fopen_nofollow(TMP_DIR, "test_filename.mg.XXXXXX", "wb", (FILE *)5);
+#else
+    will_return(__wrap_mkstemp, 8);
+    expect_value(__wrap_fchmod, fd, 8);
+    expect_value(__wrap_fchmod, mode, 0640);
+    will_return(__wrap_fchmod, 0);
+    expect_fdopen(8, "wb", (FILE *)5);
+#endif
 
     expect_value(__wrap_gzread, gz_fd, 4);
     will_return(__wrap_gzread, 4);
@@ -450,7 +524,7 @@ void test_uncompress_success(void **state) {
     expect_any(__wrap_unlink, file);
     will_return(__wrap_unlink, 0);
 
-    int ret = _uncompress("compressed_test", package, merged);
+    int ret = _uncompress(source, package, merged);
     assert_int_equal(ret, 0);
 }
 
@@ -477,7 +551,7 @@ int setup_write(void **state) {
     cJSON * command = cJSON_CreateObject();
     cJSON_AddStringToObject(command, "buffer", "ABCDABCD");
     cJSON_AddStringToObject(command, "file", "test_file");
-    cJSON_AddNumberToObject(command, "length", 8);
+    cJSON_AddNumberToObject(command, "length", 6);
     *state = command;
     test_mode = 1;
     return 0;
@@ -549,9 +623,7 @@ void test_wm_agent_upgrade_com_open_invalid_open(void **state) {
     expect_string(__wrap_w_ref_parent_folder, path, "test_file");
     will_return(__wrap_w_ref_parent_folder, 0);
 
-    expect_any(__wrap_wfopen, path);
-    expect_string(__wrap_wfopen, mode, "w");
-    will_return(__wrap_wfopen, 0);
+    expect_w_fopen_nofollow(INCOMING_DIR, "test_file", "w", NULL);
 
     expect_string(__wrap__mterror, tag, "wazuh-modulesd:agent-upgrade");
     expect_string(__wrap__mterror, formatted_msg,   "(1103): Could not open file 'test_file' due to [(2)-(No such file or directory)].");
@@ -565,15 +637,38 @@ void test_wm_agent_upgrade_com_open_invalid_open(void **state) {
     os_free(response);
 }
 
+void test_wm_agent_upgrade_com_open_symlink_rejected(void **state) {
+    cJSON * command = *state;
+
+    expect_string(__wrap_w_ref_parent_folder, path, "test_file");
+    will_return(__wrap_w_ref_parent_folder, 0);
+
+    expect_w_fopen_nofollow(INCOMING_DIR, "test_file", "w", NULL);
+
+    // The dedicated message, not the strerror-based one: on Windows strerror(ELOOP) has no text.
+    expect_string(__wrap__mterror, tag, "wazuh-modulesd:agent-upgrade");
+    expect_string(__wrap__mterror, formatted_msg,
+                  "(8142): At open: Refused to open 'test_file': the path is a symbolic link.");
+
+    errno = ELOOP;
+
+    char *response = wm_agent_upgrade_com_open(command);
+    cJSON *response_object = cJSON_Parse(response);
+    assert_int_equal(cJSON_GetObjectItem(response_object, task_manager_json_keys[WM_TASK_ERROR])->valueint, 6);
+    // The ack carries the fixed reason too, not strerror(ELOOP).
+    assert_string_equal(cJSON_GetObjectItem(response_object, task_manager_json_keys[WM_TASK_ERROR_MESSAGE])->valuestring,
+                        "File Open Error: the path is a symbolic link");
+    cJSON_Delete(response_object);
+    os_free(response);
+}
+
 void test_wm_agent_upgrade_com_open_success(void **state) {
     cJSON * command = *state;
 
     expect_string(__wrap_w_ref_parent_folder, path, "test_file");
     will_return(__wrap_w_ref_parent_folder, 0);
 
-    expect_any(__wrap_wfopen, path);
-    expect_string(__wrap_wfopen, mode, "w");
-    will_return(__wrap_wfopen, 4);
+    expect_w_fopen_nofollow(INCOMING_DIR, "test_file", "w", (FILE *)4);
 
     char *response = wm_agent_upgrade_com_open(command);
     cJSON *response_object = cJSON_Parse(response);
@@ -671,13 +766,55 @@ void test_wm_agent_upgrade_com_write_success(void **state) {
     expect_string(__wrap_w_ref_parent_folder, path, "test_file");
     will_return(__wrap_w_ref_parent_folder, 0);
 
-    will_return(__wrap_fwrite, 8);
+    will_return(__wrap_fwrite, 6);
 
     char *response = wm_agent_upgrade_com_write(command);
     cJSON *response_object = cJSON_Parse(response);
     assert_string_equal(cJSON_GetObjectItem(response_object, task_manager_json_keys[WM_TASK_ERROR_MESSAGE])->valuestring, "ok");
     cJSON_Delete(response_object);
     os_free(response);
+}
+
+static void expect_write_rejected(cJSON *command) {
+#ifdef TEST_WINAGENT
+    sprintf(file.path, "incoming\\test_file");
+#else
+    sprintf(file.path, "var/incoming/test_file");
+#endif
+
+    expect_string(__wrap__mterror, tag, "wazuh-modulesd:agent-upgrade");
+#ifdef TEST_WINAGENT
+    expect_string(__wrap__mterror, formatted_msg, "(8129): At write: Cannot write on 'incoming\\test_file'");
+#else
+    expect_string(__wrap__mterror, formatted_msg, "(8129): At write: Cannot write on 'var/incoming/test_file'");
+#endif
+
+    char *response = wm_agent_upgrade_com_write(command);
+    cJSON *response_object = cJSON_Parse(response);
+    assert_string_equal(cJSON_GetObjectItem(response_object, task_manager_json_keys[WM_TASK_ERROR_MESSAGE])->valuestring, "Cannot write file");
+    cJSON_Delete(response_object);
+    os_free(response);
+}
+
+void test_wm_agent_upgrade_com_write_missing_buffer(void **state) {
+    cJSON * command = *state;
+    cJSON_DeleteItemFromObject(command, "buffer");
+
+    expect_write_rejected(command);
+}
+
+void test_wm_agent_upgrade_com_write_length_exceeds_decoded(void **state) {
+    cJSON * command = *state;
+    cJSON_ReplaceItemInObject(command, "length", cJSON_CreateNumber(7));
+
+    expect_write_rejected(command);
+}
+
+void test_wm_agent_upgrade_com_write_negative_length(void **state) {
+    cJSON * command = *state;
+    cJSON_ReplaceItemInObject(command, "length", cJSON_CreateNumber(-1));
+
+    expect_write_rejected(command);
 }
 
 void test_wm_agent_upgrade_com_close_file_opened(void **state) {
@@ -875,8 +1012,9 @@ void test_wm_agent_upgrade_com_upgrade_uncompress_error(void **state) {
             expect_string(__wrap_w_wpk_unsign, source, "var/incoming/test_file");
 
             will_return(__wrap_mkstemp, 8);
-            expect_any(__wrap_chmod, path);
-            will_return(__wrap_chmod, 0);
+            expect_value(__wrap_fchmod, fd, 8);
+            expect_value(__wrap_fchmod, mode, 0640);
+            will_return(__wrap_fchmod, 0);
         #endif
         will_return(__wrap_w_wpk_unsign, 0);
         expect_any(__wrap_unlink, file);
@@ -924,8 +1062,9 @@ void test_wm_agent_upgrade_com_upgrade_clean_directory_error(void **state) {
             expect_string(__wrap_w_wpk_unsign, source, "var/incoming/test_file");
 
             will_return(__wrap_mkstemp, 8);
-            expect_any(__wrap_chmod, path);
-            will_return(__wrap_chmod, 0);
+            expect_value(__wrap_fchmod, fd, 8);
+            expect_value(__wrap_fchmod, mode, 0640);
+            will_return(__wrap_fchmod, 0);
         #endif
         will_return(__wrap_w_wpk_unsign, 0);
         expect_any(__wrap_unlink, file);
@@ -995,8 +1134,9 @@ void test_wm_agent_upgrade_com_unmerge_error(void **state) {
             expect_string(__wrap_w_wpk_unsign, source, "var/incoming/test_file");
 
             will_return(__wrap_mkstemp, 8);
-            expect_any(__wrap_chmod, path);
-            will_return(__wrap_chmod, 0);
+            expect_value(__wrap_fchmod, fd, 8);
+            expect_value(__wrap_fchmod, mode, 0640);
+            will_return(__wrap_fchmod, 0);
         #endif
         will_return(__wrap_w_wpk_unsign, 0);
         expect_any(__wrap_unlink, file);
@@ -1073,8 +1213,9 @@ void test_wm_agent_upgrade_com_installer_error(void **state) {
             expect_string(__wrap_w_wpk_unsign, source, "var/incoming/test_file");
 
             will_return(__wrap_mkstemp, 8);
-            expect_any(__wrap_chmod, path);
-            will_return(__wrap_chmod, 0);
+            expect_value(__wrap_fchmod, fd, 8);
+            expect_value(__wrap_fchmod, mode, 0640);
+            will_return(__wrap_fchmod, 0);
         #endif
         will_return(__wrap_w_wpk_unsign, 0);
         expect_any(__wrap_unlink, file);
@@ -1117,7 +1258,7 @@ void test_wm_agent_upgrade_com_installer_error(void **state) {
     expect_any(__wrap_UnmergeFiles, finalpath);
     expect_any(__wrap_UnmergeFiles, optdir);
     expect_value(__wrap_UnmergeFiles, mode, OS_BINARY);
-    will_return(__wrap_UnmergeFiles, -1);
+    will_return(__wrap_UnmergeFiles, UNMERGE_COMPLETE);
 
     expect_any(__wrap_unlink, file);
     will_return(__wrap_unlink, 0);
@@ -1154,8 +1295,9 @@ void test_wm_agent_upgrade_com_chmod_error(void **state) {
             expect_string(__wrap_w_wpk_unsign, source, "var/incoming/test_file");
 
             will_return(__wrap_mkstemp, 8);
-            expect_any(__wrap_chmod, path);
-            will_return(__wrap_chmod, 0);
+            expect_value(__wrap_fchmod, fd, 8);
+            expect_value(__wrap_fchmod, mode, 0640);
+            will_return(__wrap_fchmod, 0);
         #endif
         will_return(__wrap_w_wpk_unsign, 0);
         expect_any(__wrap_unlink, file);
@@ -1198,7 +1340,7 @@ void test_wm_agent_upgrade_com_chmod_error(void **state) {
     expect_any(__wrap_UnmergeFiles, finalpath);
     expect_any(__wrap_UnmergeFiles, optdir);
     expect_value(__wrap_UnmergeFiles, mode, OS_BINARY);
-    will_return(__wrap_UnmergeFiles, -1);
+    will_return(__wrap_UnmergeFiles, UNMERGE_COMPLETE);
 
     expect_any(__wrap_unlink, file);
     will_return(__wrap_unlink, 0);
@@ -1241,8 +1383,9 @@ void test_wm_agent_upgrade_com_execute_error(void **state) {
             expect_string(__wrap_w_wpk_unsign, source, "var/incoming/test_file");
 
             will_return(__wrap_mkstemp, 8);
-            expect_any(__wrap_chmod, path);
-            will_return(__wrap_chmod, 0);
+            expect_value(__wrap_fchmod, fd, 8);
+            expect_value(__wrap_fchmod, mode, 0640);
+            will_return(__wrap_fchmod, 0);
         #endif
         will_return(__wrap_w_wpk_unsign, 0);
         expect_any(__wrap_unlink, file);
@@ -1285,7 +1428,7 @@ void test_wm_agent_upgrade_com_execute_error(void **state) {
     expect_any(__wrap_UnmergeFiles, finalpath);
     expect_any(__wrap_UnmergeFiles, optdir);
     expect_value(__wrap_UnmergeFiles, mode, OS_BINARY);
-    will_return(__wrap_UnmergeFiles, -1);
+    will_return(__wrap_UnmergeFiles, UNMERGE_COMPLETE);
 
     expect_any(__wrap_unlink, file);
     will_return(__wrap_unlink, 0);
@@ -1345,8 +1488,9 @@ void test_wm_agent_upgrade_com_success(void **state) {
             expect_string(__wrap_w_wpk_unsign, source, "var/incoming/test_file");
 
             will_return(__wrap_mkstemp, 8);
-            expect_any(__wrap_chmod, path);
-            will_return(__wrap_chmod, 0);
+            expect_value(__wrap_fchmod, fd, 8);
+            expect_value(__wrap_fchmod, mode, 0640);
+            will_return(__wrap_fchmod, 0);
         #endif
         will_return(__wrap_w_wpk_unsign, 0);
         expect_any(__wrap_unlink, file);
@@ -1389,7 +1533,7 @@ void test_wm_agent_upgrade_com_success(void **state) {
     expect_any(__wrap_UnmergeFiles, finalpath);
     expect_any(__wrap_UnmergeFiles, optdir);
     expect_value(__wrap_UnmergeFiles, mode, OS_BINARY);
-    will_return(__wrap_UnmergeFiles, -1);
+    will_return(__wrap_UnmergeFiles, UNMERGE_COMPLETE);
 
     expect_any(__wrap_unlink, file);
     will_return(__wrap_unlink, 0);
@@ -1521,7 +1665,7 @@ int setup_process_write(void **state) {
     cJSON * parameters = cJSON_CreateObject();
     cJSON_AddStringToObject(parameters, "buffer", "ABCDABCD");
     cJSON_AddStringToObject(parameters, "file", "test_file");
-    cJSON_AddNumberToObject(parameters, "length", 8);
+    cJSON_AddNumberToObject(parameters, "length", 6);
     cJSON_AddItemToObject(command, "parameters", parameters);
     char *ptr = cJSON_PrintUnformatted(command);
     *state = ptr;
@@ -1664,7 +1808,7 @@ void test_wm_agent_upgrade_process_write_command(void **state) {
         expect_string(__wrap_w_ref_parent_folder, path, "test_file");
         will_return(__wrap_w_ref_parent_folder, 0);
 
-        will_return(__wrap_fwrite, 8);
+        will_return(__wrap_fwrite, 6);
     }
 
     size_t length = wm_agent_upgrade_process_command(buffer, &output);
@@ -1746,8 +1890,9 @@ void test_wm_agent_upgrade_process_upgrade_command(void **state) {
                 expect_string(__wrap_w_wpk_unsign, source, "var/incoming/test_file");
 
                 will_return(__wrap_mkstemp, 8);
-                expect_any(__wrap_chmod, path);
-                will_return(__wrap_chmod, 0);
+                expect_value(__wrap_fchmod, fd, 8);
+                expect_value(__wrap_fchmod, mode, 0640);
+                will_return(__wrap_fchmod, 0);
             #endif
             will_return(__wrap_w_wpk_unsign, 0);
             expect_any(__wrap_unlink, file);
@@ -1790,7 +1935,7 @@ void test_wm_agent_upgrade_process_upgrade_command(void **state) {
         expect_any(__wrap_UnmergeFiles, finalpath);
         expect_any(__wrap_UnmergeFiles, optdir);
         expect_value(__wrap_UnmergeFiles, mode, OS_BINARY);
-        will_return(__wrap_UnmergeFiles, -1);
+        will_return(__wrap_UnmergeFiles, UNMERGE_COMPLETE);
 
         expect_any(__wrap_unlink, file);
         will_return(__wrap_unlink, 0);
@@ -1857,6 +2002,9 @@ int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_jailfile_invalid_path, setup_jailfile, teardown_jailfile),
         cmocka_unit_test_setup_teardown(test_jailfile_valid_path, setup_jailfile, teardown_jailfile),
+        cmocka_unit_test(test_jailfile_empty_name),
+        cmocka_unit_test(test_jailfile_current_folder),
+        cmocka_unit_test(test_jailfile_path_separator),
         cmocka_unit_test_setup_teardown(test_unsign_invalid_source_incomming, setup_jailfile, teardown_jailfile),
         cmocka_unit_test_setup_teardown(test_unsign_invalid_source_temp, setup_jailfile, teardown_jailfile),
         #ifdef TEST_WINAGENT
@@ -1879,12 +2027,16 @@ int main(void) {
         cmocka_unit_test_setup_teardown(test_wm_agent_upgrade_com_open_unsopported_mode, setup_open1, teardown_commands),
         cmocka_unit_test_setup_teardown(test_wm_agent_upgrade_com_open_invalid_file_name, setup_open2, teardown_commands),
         cmocka_unit_test_setup_teardown(test_wm_agent_upgrade_com_open_invalid_open, setup_open2, teardown_commands),
+        cmocka_unit_test_setup_teardown(test_wm_agent_upgrade_com_open_symlink_rejected, setup_open2, teardown_commands),
         cmocka_unit_test_setup_teardown(test_wm_agent_upgrade_com_open_success, setup_open2, teardown_commands),
         cmocka_unit_test_setup_teardown(test_wm_agent_upgrade_com_write_file_closed, setup_write, teardown_commands),
         cmocka_unit_test_setup_teardown(test_wm_agent_upgrade_com_write_invalid_file_name, setup_write, teardown_commands),
         cmocka_unit_test_setup_teardown(test_wm_agent_upgrade_com_write_different_file_name, setup_write, teardown_commands),
         cmocka_unit_test_setup_teardown(test_wm_agent_upgrade_com_write_error, setup_write, teardown_commands),
         cmocka_unit_test_setup_teardown(test_wm_agent_upgrade_com_write_success, setup_write, teardown_commands),
+        cmocka_unit_test_setup_teardown(test_wm_agent_upgrade_com_write_missing_buffer, setup_write, teardown_commands),
+        cmocka_unit_test_setup_teardown(test_wm_agent_upgrade_com_write_length_exceeds_decoded, setup_write, teardown_commands),
+        cmocka_unit_test_setup_teardown(test_wm_agent_upgrade_com_write_negative_length, setup_write, teardown_commands),
         cmocka_unit_test_setup_teardown(test_wm_agent_upgrade_com_close_file_opened, setup_write, teardown_commands),
         cmocka_unit_test_setup_teardown(test_wm_agent_upgrade_com_close_invalid_file_name, setup_write, teardown_commands),
         cmocka_unit_test_setup_teardown(test_wm_agent_upgrade_com_close_different_file_name, setup_write, teardown_commands),

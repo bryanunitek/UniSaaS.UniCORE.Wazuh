@@ -379,6 +379,31 @@ void get_exec_msg(const active_response *ar, char *agent_id, const char *msg, ch
 }
 
 /**
+ * @brief Connect to an active response queue.
+ *
+ * The socket is given a send timeout: a reader that stops draining the queue must never
+ * block the rule matching threads, so it is never left without one.
+ *
+ * @param queue_path Queue to connect to.
+ * @return Socket descriptor on success, OS_INVALID on error.
+ */
+int connect_exec_queue(const char *queue_path) {
+    int sock = StartMQ(queue_path, WRITE, 1);
+
+    if (sock < 0) {
+        return OS_INVALID;
+    }
+
+    if (OS_SetSendTimeout(sock, EXEC_SEND_TIMEOUT_S) < 0) {
+        merror(EXEC_QUEUE_SET_TIMEOUT_ERROR, queue_path, strerror(errno), errno);
+        OS_CloseSocket(sock);
+        return OS_INVALID;
+    }
+
+    return sock;
+}
+
+/**
  * @brief Send the message to the socket. Tries to reconnect one time if the socket is not valid.
  *
  * @param socket Socket where the message will be sent.
@@ -388,16 +413,35 @@ void get_exec_msg(const active_response *ar, char *agent_id, const char *msg, ch
  */
 void send_exec_msg(int *socket, const char *queue_path, const char *exec_msg) {
     static int conn_error_sent = 0;
+    /* Serializes the socket shared by the rule matching threads: without it a thread may
+     * close and replace the descriptor while another one is still sending through it */
+    static pthread_mutex_t exec_sock_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+    w_mutex_lock(&exec_sock_mutex);
 
     if (*socket < 0) {
-        if ((*socket = StartMQ(queue_path, WRITE, 1)) < 0) {
+        /* Connect with the mutex released: connecting may block, and a thread waiting
+         * inside connect_exec_queue must not stall the rest of the rule matching threads */
+        w_mutex_unlock(&exec_sock_mutex);
+        int new_socket = connect_exec_queue(queue_path);
+        int conn_errno = errno;
+        w_mutex_lock(&exec_sock_mutex);
+
+        if (*socket >= 0) {
+            /* Another thread reconnected while the mutex was released: keep its socket */
+            if (new_socket >= 0) {
+                OS_CloseSocket(new_socket);
+            }
+        } else if (new_socket < 0) {
             if (conn_error_sent == 0){
-                merror(QUEUE_ERROR, queue_path, strerror(errno));
+                merror(QUEUE_ERROR, queue_path, strerror(conn_errno));
                 conn_error_sent = 1;
             }
 
+            w_mutex_unlock(&exec_sock_mutex);
             return;
         } else {
+            *socket = new_socket;
             conn_error_sent = 0;
         }
     }
@@ -411,4 +455,6 @@ void send_exec_msg(int *socket, const char *queue_path, const char *exec_msg) {
         *socket = -1;
         merror(EXEC_QUEUE_CONNECTION_ERROR, queue_path);
     }
+
+    w_mutex_unlock(&exec_sock_mutex);
 }

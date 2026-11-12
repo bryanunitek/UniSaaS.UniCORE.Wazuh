@@ -218,7 +218,15 @@ if [ $1 = 0 ];then
     rmgroup wazuh
   fi
 
-  rm -rf %{_localstatedir}/ruleset
+  # Remove lingering folders and files
+  rm -rf %{_localstatedir}/etc/shared/
+  rm -rf %{_localstatedir}/queue/
+  rm -rf %{_localstatedir}/var/
+  rm -rf %{_localstatedir}/bin/
+  rm -rf %{_localstatedir}/logs/
+  rm -rf %{_localstatedir}/backup/
+  rm -rf %{_localstatedir}/ruleset/
+  rm -rf %{_localstatedir}/tmp
 fi
 
 %clean
@@ -281,6 +289,12 @@ rm -fr %{buildroot}
 %attr(750, root, wazuh) %{_localstatedir}/wodles/*
 
 %changelog
+* Thu Nov 05 2026 support <info@wazuh.com> - 4.14.10
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-14-10.html
+* Wed Jul 29 2026 support <info@wazuh.com> - 4.14.7
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-14-7.html
+* Tue Jun 09 2026 support <info@wazuh.com> - 4.14.6
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-14-6.html
 * Thu Apr 23 2026 support <info@wazuh.com> - 4.14.5
 - More info: https://documentation.wazuh.com/current/release-notes/release-4-14-5.html
 * Tue Mar 17 2026 support <info@wazuh.com> - 4.14.4

@@ -6,6 +6,7 @@
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import os
 import signal
@@ -86,7 +87,7 @@ async def master_main(args: argparse.Namespace, cluster_config: dict, cluster_it
 
     cluster_utils.context_tag.set('Master')
     my_server = master.Master(performance_test=args.performance_test, concurrency_test=args.concurrency_test,
-                              configuration=cluster_config, enable_ssl=args.ssl, logger=logger,
+                              configuration=cluster_config, logger=logger,
                               cluster_items=cluster_items)
     # Spawn pool processes
     if my_server.task_pool is not None:
@@ -94,12 +95,35 @@ async def master_main(args: argparse.Namespace, cluster_config: dict, cluster_it
 
     my_local_server = local_server.LocalServerMaster(performance_test=args.performance_test, logger=logger,
                                                      concurrency_test=args.concurrency_test, node=my_server,
-                                                     configuration=cluster_config, enable_ssl=args.ssl,
+                                                     configuration=cluster_config,
                                                      cluster_items=cluster_items)
     tasks = [my_server, my_local_server]
     if not cluster_config.get(cluster_utils.HAPROXY_HELPER, {}).get(cluster_utils.HAPROXY_DISABLED, True):
         tasks.append(HAPHelper)
-    await asyncio.gather(*[task.start() for task in tasks])
+
+    # Handle SIGTERM within the loop so cluster connections can be closed gracefully before the process exits.
+    # This replaces the process-wide handler installed in `signal.signal(signal.SIGTERM, exit_handler)` for the
+    # remainder of the master's lifetime, letting the workers see a clean EOF instead of a connection reset.
+    loop = asyncio.get_running_loop()
+    shutdown_event = asyncio.Event()
+    loop.add_signal_handler(signal.SIGTERM, shutdown_event.set)
+
+    server_task = asyncio.ensure_future(asyncio.gather(*[task.start() for task in tasks]))
+    shutdown_task = asyncio.ensure_future(shutdown_event.wait())
+    done, _ = await asyncio.wait([server_task, shutdown_task], return_when=asyncio.FIRST_COMPLETED)
+
+    if shutdown_task in done:
+        logger.info("SIGNAL [(15)-(SIGTERM)] received. Closing cluster connections gracefully. Exit...")
+        for client in list(my_server.clients.values()) + list(my_local_server.clients.values()):
+            client.transport.close()
+        server_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await server_task
+    else:
+        shutdown_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await shutdown_task
+        await server_task
 
 
 #
@@ -138,13 +162,13 @@ async def worker_main(args: argparse.Namespace, cluster_config: dict, cluster_it
         task_pool = None
 
     while True:
-        my_client = worker.Worker(configuration=cluster_config, enable_ssl=args.ssl,
+        my_client = worker.Worker(configuration=cluster_config,
                                   performance_test=args.performance_test, concurrency_test=args.concurrency_test,
                                   file=args.send_file, string=args.send_string, logger=logger,
                                   cluster_items=cluster_items, task_pool=task_pool)
         my_local_server = local_server.LocalServerWorker(performance_test=args.performance_test, logger=logger,
                                                          concurrency_test=args.concurrency_test, node=my_client,
-                                                         configuration=cluster_config, enable_ssl=args.ssl,
+                                                         configuration=cluster_config,
                                                          cluster_items=cluster_items)
         # Spawn pool processes
         if my_client.task_pool is not None:
@@ -182,7 +206,6 @@ def get_script_arguments() -> argparse.Namespace:
     # implemented in worker nodes.
     parser.add_argument('--file', help=argparse.SUPPRESS, type=str, dest='send_file')
     ####################################################################################################################
-    parser.add_argument('--ssl', help="Enable communication over SSL", action='store_true', dest='ssl', default=False)
     parser.add_argument('-f', help="Run in foreground", action='store_true', dest='foreground')
     parser.add_argument('-d', help="Enable debug messages. Use twice to increase verbosity.", action='count',
                         dest='debug_level')

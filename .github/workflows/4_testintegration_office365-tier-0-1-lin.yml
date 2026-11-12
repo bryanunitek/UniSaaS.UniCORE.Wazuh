@@ -8,6 +8,7 @@ on:
         required: true
         default: 'main'
   pull_request:
+    types: [synchronize, opened, reopened, ready_for_review]
     paths:
         - ".github/workflows/4_testintegration_office365-tier-0-1-lin.yml"
         - "src/config/wmodules-office365.c"
@@ -19,13 +20,20 @@ on:
 
 jobs:
   build:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     env:
       BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
       BRANCH_BASE: ${{ github.base_ref || inputs.base_branch }}
-    runs-on: wz-linux-amd64
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v3
+      - name: Install system build dependencies
+        # TODO: Remove when added to CodeBuild base images
+        run: sudo apt-get update && sudo apt-get install -y python3-pip
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
@@ -33,6 +41,21 @@ jobs:
           architecture: x64
       - name: "Install a compatible CMake"
         uses: ./.github/actions/reinstall_cmake
+      # Compilation cache (issue 38139). Skipped on fork PRs (no credentials).
+      - name: "Configure AWS credentials for the compilation cache"
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          aws-region: ${{ secrets.CI_AWS_REGION }}
+          role-duration-seconds: 7200
+      - name: "Set up sccache"
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/setup-sccache
+        with:
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          region: ${{ secrets.CI_AWS_REGION }}
+          key-prefix: sccache/4.14.8
       # Build wazuh agent for linux.
       - name: Build wazuh agent for linux
         run: |
@@ -83,10 +106,13 @@ jobs:
               QA_BRANCH="main"
           fi
           git clone -b ${QA_BRANCH} --single-branch https://github.com/wazuh/qa-integration-framework.git
-          sudo pip install --ignore-installed qa-integration-framework/
+          sudo pip install --ignore-installed --break-system-packages qa-integration-framework/
           sudo rm -rf qa-integration-framework/
       # Run office365 integration tests.
       - name: Run office365 integration tests
         run: |
           cd tests/integration
           sudo python -m pytest --tier 0 --tier 1 test_office365/
+      - name: "Compilation cache statistics"
+        if: always()
+        run: sccache --show-stats 2>/dev/null | grep -viE "cache location|bucket" || true

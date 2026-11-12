@@ -19,7 +19,7 @@ from wazuh.core import cluster as metadata, common, exception, utils, analysis
 from wazuh.core.cluster import client, cluster, common as c_common
 from wazuh.core.cluster.utils import log_subprocess_execution, safe_join
 from wazuh.core.cluster.dapi import dapi
-from wazuh.core.exception import WazuhException
+from wazuh.core.exception import WazuhException, WazuhClusterError
 from wazuh.core.utils import safe_move, get_utc_now
 from wazuh.core.wdb import AsyncWazuhDBConnection
 
@@ -792,12 +792,20 @@ class WorkerHandler(client.AbstractClient, c_common.WazuhCommon):
             full_filename_path = safe_join(common.WAZUH_PATH, filename)
 
             if data_['merged']:  # worker nodes can only receive agent-groups files
+                item_key = data_['cluster_item_key']
+                if item_key not in cluster_items['files']:
+                    raise WazuhClusterError(3022, extra_message=f"Invalid cluster_item_key: {item_key}")
+
                 # Split merged file into individual files inside zipdir (directory containing unzipped files),
                 # and then move each one to the destination directory (<wazuh_path>/filename).
                 # The TYPE string used in the 'unmerge_info' function is a placeholder. It corresponds to the
                 # directory inside '{wazuh_path}/queue/' path.
                 for name, content, _ in cluster.unmerge_info('TYPE', zip_path, filename_):
                     full_unmerged_name = safe_join(common.WAZUH_PATH, name)
+                    expected_base = safe_join(common.WAZUH_PATH, item_key)
+                    if not os.path.commonpath([full_unmerged_name, expected_base]).startswith(expected_base):
+                        raise WazuhClusterError(3022,
+                            extra_message=f"File path outside allowed directory: {name}")
                     tmp_unmerged_path = full_unmerged_name + '.tmp'
                     with open(tmp_unmerged_path, 'wb') as f:
                         f.write(content)
@@ -806,17 +814,25 @@ class WorkerHandler(client.AbstractClient, c_common.WazuhCommon):
                               ownership=(common.wazuh_uid(), common.wazuh_gid())
                               )
             else:
+                item_key = data_['cluster_item_key']
+                if item_key not in cluster_items['files']:
+                    raise WazuhClusterError(3022, extra_message=f"Invalid cluster_item_key: {item_key}")
+                expected_base = safe_join(common.WAZUH_PATH, item_key)
+                if not os.path.commonpath([full_filename_path, expected_base]).startswith(expected_base):
+                    raise WazuhClusterError(3022,
+                        extra_message=f"File path outside allowed directory: {filename_}")
                 # Create destination dir if it doesn't exist.
                 if not os.path.exists(os.path.dirname(full_filename_path)):
                     utils.mkdir_with_mode(os.path.dirname(full_filename_path))
                 # Move the file from zipdir (directory containing unzipped files) to <wazuh_path>/filename.
                 safe_move(safe_join(zip_path, filename_), full_filename_path,
-                          permissions=cluster_items['files'][data_['cluster_item_key']]['permissions'],
+                          permissions=cluster_items['files'][item_key]['permissions'],
                           ownership=(common.wazuh_uid(), common.wazuh_gid())
                           )
 
         errors = {'shared': 0, 'missing': 0, 'extra': 0}
         result_logs = {'debug2': defaultdict(list), 'error': defaultdict(list), 'generic_errors': []}
+        validated_extra = {}  # extra entries that cleared all security checks, used for dir cleanup
 
         for filetype, files in ko_files.items():
             # Overwrite local files marked as shared or missing.
@@ -832,14 +848,24 @@ class WorkerHandler(client.AbstractClient, c_common.WazuhCommon):
                         continue
             # Remove local files marked as extra.
             elif filetype == 'extra':
-                for file_to_remove in files:
+                for file_to_remove, file_data in files.items():
                     try:
                         result_logs['debug2'][file_to_remove].append(f"Remove file: '{file_to_remove}'")
+                        item_key = file_data['cluster_item_key']
+                        if item_key not in cluster_items['files']:
+                            raise WazuhClusterError(3022,
+                                extra_message=f"Invalid cluster_item_key: {item_key}")
                         file_path = safe_join(common.WAZUH_PATH, file_to_remove)
+                        expected_base = safe_join(common.WAZUH_PATH, item_key)
+                        if not os.path.commonpath([file_path, expected_base]).startswith(expected_base):
+                            raise WazuhClusterError(3022,
+                                extra_message=f"File path outside allowed directory: {file_to_remove}")
                         try:
                             os.remove(file_path)
+                            validated_extra[file_to_remove] = file_data
                         except OSError as e:
                             if e.errno == errno.ENOENT:
+                                validated_extra[file_to_remove] = file_data
                                 result_logs['debug2'][file_to_remove].append(f"File {file_to_remove} "
                                                                              f"doesn't exist.")
                                 continue
@@ -852,7 +878,7 @@ class WorkerHandler(client.AbstractClient, c_common.WazuhCommon):
                         continue
 
         # Once files are deleted, check and remove subdirectories which are now empty, as specified in cluster.json.
-        directories_to_check = set(os.path.dirname(f) for f, data in ko_files['extra'].items()
+        directories_to_check = set(os.path.dirname(f) for f, data in validated_extra.items()
                                    if cluster_items['files'][data['cluster_item_key']]['remove_subdirs_if_empty'])
         for directory in directories_to_check:
             try:
@@ -864,9 +890,6 @@ class WorkerHandler(client.AbstractClient, c_common.WazuhCommon):
                 errors['extra'] += 1
                 result_logs["debug2"][directory].append(f"Error removing directory '{directory}': {e}")
                 continue
-
-            except Exception as e:
-                result_logs['generic_errors'].append(f"Error reloading ruleset {e}")
 
         if sum(errors.values()) > 0:
             result_logs['generic_errors'].append(f"Found errors: {errors['shared']} overwriting, "

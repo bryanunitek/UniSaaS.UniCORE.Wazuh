@@ -23,9 +23,84 @@
 static FILE *fp = NULL;
 static char file_sum[34] = "";
 static char file[OS_SIZE_1024 + 1] = "";
+static int receiving_merged = 0;
 #ifdef WIN32
 w_queue_t * winexec_queue;
 #endif
+
+/* Reports that the shared files could not be completely updated */
+static void report_unmerge_error(void)
+{
+    char msg_output[OS_MAXSTR];
+
+    snprintf(msg_output, OS_MAXSTR, "%c:%s:%s", LOCALFILE_MQ, "wazuh-agent", AG_IN_UNMERGE);
+    send_msg(msg_output, -1);
+}
+
+/* Reloads the agent or reports the new shared configuration, according to the agent settings */
+static void apply_shared_configuration(void)
+{
+    clear_merged_hash_cache();
+    if (agt->flags.remote_conf && !verifyRemoteConf()) {
+        if (agt->flags.auto_restart) {
+            minfo("Agent is reloading due to shared configuration changes.");
+            reloadAgent();
+        } else {
+            minfo("Shared agent configuration has been updated.");
+        }
+    }
+}
+
+/* Drops the received bundle and the accepted one, since the shared directory may now match neither. Without an
+ * accepted bundle the agent reports no hash, so the manager sends whatever the group holds again. */
+static void discard_shared_bundles(const char *bundle)
+{
+    unlink(bundle);
+    unlink(SHAREDCFG_FILE);
+    clear_merged_hash_cache();
+    report_unmerge_error();
+}
+
+/* Files kept in the shared directory besides the extracted entries */
+static char **shared_bundle_files(void)
+{
+    char **list;
+
+    os_calloc(3, sizeof(char *), list);
+    os_strdup(SHAREDCFG_FILENAME, list[0]);
+    os_strdup(SHAREDCFG_TMPFILENAME, list[1]);
+    return list;
+}
+
+/* Extracts a bundle into the shared directory and removes the files it no longer has. A file that cannot be
+ * removed does not fail the update, since sending the bundle again would not remove it either. */
+static int extract_shared_bundle(const char *bundle)
+{
+    char **kept = shared_bundle_files();
+    int result = UnmergeFiles(bundle, SHAREDCFG_DIR, OS_TEXT, &kept);
+
+    if (result != UNMERGE_FAILED && cldir_ex_ignore(SHAREDCFG_DIR, (const char **)kept)) {
+        mwarn("Could not clean up shared directory.");
+    }
+    free_strarray(kept);
+    return result;
+}
+
+/* Publishes a received bundle as the accepted one once its entries are extracted. Entries with invalid names are
+ * skipped, since the manager would send them unchanged again; other failures leave the update pending. */
+static void update_shared_files(const char *bundle)
+{
+    int result = extract_shared_bundle(bundle);
+
+    if (result == UNMERGE_FAILED || rename_ex(bundle, SHAREDCFG_FILE) != 0) {
+        discard_shared_bundles(bundle);
+        return;
+    }
+    if (result == UNMERGE_NAMES_SKIPPED) {
+        report_unmerge_error();
+    }
+    apply_shared_configuration();
+}
 
 /* Receive events from the server */
 int receive_msg()
@@ -37,6 +112,7 @@ int receive_msg()
     char buffer[OS_MAXSTR + 1];
     char cleartext[OS_MAXSTR + 1];
     char *tmp_msg;
+    const int sock = atomic_int_get(&agt->sock);
 
     memset(cleartext, '\0', OS_MAXSTR + 1);
     memset(buffer, '\0', OS_MAXSTR + 1);
@@ -49,7 +125,8 @@ int receive_msg()
                 break;
             }
 
-            recv_b = OS_RecvSecureTCP(agt->sock, buffer, OS_MAXSTR);
+            /* poll() bound for sockets where SO_RCVTIMEO is unsupported */
+            recv_b = OS_RecvSecureTCPTimeout(sock, buffer, OS_MAXSTR, atomic_int_get(&recv_poll_timeout));
 
             // Manager disconnected or error
 
@@ -79,7 +156,7 @@ int receive_msg()
                 return -1;
             }
         } else {
-            recv_b = recv(agt->sock, buffer, OS_MAXSTR, MSG_DONTWAIT);
+            recv_b = recv(sock, buffer, OS_MAXSTR, MSG_DONTWAIT);
 
             if (recv_b <= 0) {
                 break;
@@ -123,14 +200,7 @@ int receive_msg()
             else if (strncmp(tmp_msg, HC_FORCE_RECONNECT, strlen(HC_FORCE_RECONNECT)) == 0) {
                 /* Set lock and wait for it */
                 minfo("Wazuh Agent will be reconnected because a reconnect message was received");
-                os_setwait();
-                w_agentd_state_update(UPDATE_STATUS, (void *) GA_STATUS_NACTIVE);
-
-                /* Send sync message */
-                start_agent(0);
-
-                os_delwait();
-                w_agentd_state_update(UPDATE_STATUS, (void *) GA_STATUS_ACTIVE);
+                reconnect_to_server();
                 continue;
             }
 
@@ -244,13 +314,14 @@ int receive_msg()
                     tmp_msg[0] = '-';
                 }
 
-                snprintf(file, OS_SIZE_1024, "%s/%s",
-                         SHAREDCFG_DIR,
-                         tmp_msg);
+                receiving_merged = strcmp(tmp_msg, SHAREDCFG_FILENAME) == 0;
+                snprintf(file, OS_SIZE_1024, "%s/%s", SHAREDCFG_DIR,
+                         receiving_merged ? SHAREDCFG_TMPFILENAME : tmp_msg);
 
                 fp = wfopen(file, "w");
                 if (!fp) {
                     merror(FOPEN_ERROR, file, errno, strerror(errno));
+                    file[0] = '\0';
                 }
             }
 
@@ -278,31 +349,8 @@ int receive_msg()
                         /* Rename the file to its original name */
                         final_file = strrchr(file, '/');
                         if (final_file) {
-                            if (strcmp(final_file + 1, SHAREDCFG_FILENAME) == 0) {
-                                char **ignore_list;
-                                os_calloc(2, sizeof(char *), ignore_list);
-                                os_strdup(SHAREDCFG_FILENAME, *ignore_list);
-                                if (!UnmergeFiles(file, SHAREDCFG_DIR, OS_TEXT, &ignore_list)) {
-                                    char msg_output[OS_MAXSTR];
-
-                                    snprintf(msg_output, OS_MAXSTR, "%c:%s:%s",  LOCALFILE_MQ, "wazuh-agent", AG_IN_UNMERGE);
-                                    send_msg(msg_output, -1);
-                                }
-                                else {
-                                    if (cldir_ex_ignore(SHAREDCFG_DIR, (const char **)ignore_list)) {
-                                        mwarn("Could not clean up shared directory.");
-                                    }
-                                    clear_merged_hash_cache();
-                                    if (agt->flags.remote_conf && !verifyRemoteConf()) {
-                                        if (agt->flags.auto_restart) {
-                                            minfo("Agent is reloading due to shared configuration changes.");
-                                            reloadAgent();
-                                        } else {
-                                            minfo("Shared agent configuration has been updated.");
-                                        }
-                                    }
-                                }
-                                free_strarray(ignore_list);
+                            if (receiving_merged) {
+                                update_shared_files(file);
                             }
                         } else {
                             /* Remove file */
@@ -349,23 +397,47 @@ int receiver_messages()
             ExecdTimeoutRun();
         }
 
+#ifndef ONEWAY_ENABLED
         /* sock must be set */
-        if (agt->sock == -1) {
-            sleep(5);
+        int sock = atomic_int_get(&agt->sock);
+        if (sock == -1) {
+            merror(LOST_ERROR);
+            reconnect_to_server();
+            minfo(SERVER_UP);
             continue;
         }
+#else
+        /* start_agent() never actually connects under ONEWAY_ENABLED (see
+         * start_agent.c), so agt->sock never leaves -1 -- checking it here
+         * would spin this loop at 100% CPU instead of being paced by
+         * select()'s timeout below, same reasoning as the Linux monitor
+         * loop in agentd.c. */
+        int sock = atomic_int_get(&agt->sock);
+#endif
 
         run_notify();
 
+#ifndef ONEWAY_ENABLED
+        /* run_notify() may also invalidate the socket (it calls send_msg()
+         * for the keep-alive); re-check before FD_SET() needs it, same as
+         * the Linux monitor loop in agentd.c. */
+        sock = atomic_int_get(&agt->sock);
+        if (sock < 0) {
+            continue;
+        }
+#else
+        sock = atomic_int_get(&agt->sock);
+#endif
+
         FD_ZERO(&fdset);
-        FD_SET(agt->sock, &fdset);
+        FD_SET(sock, &fdset);
 
         /* Wait for 1 second */
         selecttime.tv_sec = 1;
         selecttime.tv_usec = 0;
 
         /* Wait with a timeout for any descriptor */
-        rc = select(agt->sock + 1, &fdset, NULL, NULL, &selecttime);
+        rc = select(sock + 1, &fdset, NULL, NULL, &selecttime);
         if (rc == -1) {
             merror(SELECT_ERROR, WSAGetLastError(), win_strerror(WSAGetLastError()));
             sleep(30);
@@ -375,13 +447,9 @@ int receiver_messages()
         }
 
         if (receive_msg() < 0) {
-            w_agentd_state_update(UPDATE_STATUS, (void *) GA_STATUS_NACTIVE);
             merror(LOST_ERROR);
-            os_setwait();
-            start_agent(0);
+            reconnect_to_server();
             minfo(SERVER_UP);
-            os_delwait();
-            w_agentd_state_update(UPDATE_STATUS, (void *) GA_STATUS_ACTIVE);
         }
     }
 

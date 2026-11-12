@@ -198,10 +198,12 @@
 #define EXEC_INV_CMD    "(1316): Invalid AR command: '%s'"
 #define EXEC_CMD_FAIL   "(1317): Could not launch command %s (%d)"
 #define EXEC_BAD_NAME   "(1318): Command name truncated %s"
+#define EXEC_MAX_AR     "(1319): Reached the limit of %d active response commands. Ignoring the remaining entries of '%s'."
 
 #define AR_NOAGENT_ERROR                "(1320): Agent '%s' not found."
 #define EXEC_QUEUE_CONNECTION_ERROR     "(1321): Error communicating with queue '%s'."
 #define EXEC_QUEUE_BUSY                 "(1322): Socket busy."
+#define EXEC_QUEUE_SET_TIMEOUT_ERROR    "(1323): Cannot set send timeout on queue '%s': %s (%d)"
 
 /* List operations */
 #define LIST_ERROR      "(1290): Unable to create a new list (calloc)."
@@ -326,6 +328,10 @@
 #define RL_NO_OPT       "(5106): Rule '%d' without any options. "\
                         "It may lead to false positives. Exiting. "
 #define RL_REGEX_SYNTAX "(5107): Syntax error on tag '%s' in rule %d"
+#define RL_TREE_NODE_LIMIT  "(5108): Rule '%d' in '%s' exceeds the rule tree node limit " \
+                            "(%zu nodes in the tree, %zu added by this rule, limit %zu). Ruleset loading aborted."
+#define RL_TREE_NODE_THRESHOLDS "(5109): Invalid rule tree thresholds: 'analysisd.rule_tree_memory_warning' " \
+                                "(%zu nodes) must be lower than 'analysisd.rule_tree_memory_limit' (%zu nodes)."
 
 /* Syslog output */
 #define XML_INV_CSYSLOG    "(5301): Invalid client-syslog configuration."
@@ -490,7 +496,17 @@
 #define FIM_ERROR_EBPF_RINGBUFF_CONSUME             "(6977): Consuming ring buffer failed."
 #define FIM_ERROR_EBPF_HEALTHCHECK_TIMEOUT          "(6978): eBPF healthcheck timeout."
 #define FIM_ERROR_EBPF_HEALTHCHECK_FILE_DEL         "(6979): Healthcheck file can't be removed. Path: %s"
-#define FIM_ERROR_EBPF_INVALID_KERNEL               "(6980): Invalid Kernel version detected. Must be +5.8."
+#define FIM_ERROR_EBPF_HEALTHCHECK_ACTION_FAILED    "(6981): eBPF healthcheck action failed: %s. %s"
+#define FIM_ERROR_EBPF_HEALTHCHECK_ACTION_SKIPPED   "(6982): eBPF healthcheck action skipped: %s. %s"
+#define FIM_ERROR_EBPF_OBJ_ATTACH_DETAIL            "(6983): Attaching BPF program '%s' failed (errno=%d: %s)."
+#define FIM_EBPF_HEALTHCHECK_EVENT_CONSUME_DETAIL   "Failed while consuming healthcheck events."
+#define FIM_EBPF_HEALTHCHECK_EVENT_TIMEOUT_DETAIL   "Timed out waiting for the corresponding event."
+#define FIM_EBPF_HEALTHCHECK_CREATE_DETAIL          "Could not create the temporary healthcheck file."
+#define FIM_EBPF_HEALTHCHECK_CONTENT_DETAIL         "Could not open the healthcheck file for append."
+#define FIM_EBPF_HEALTHCHECK_STAT_DETAIL            "Could not stat the healthcheck file. Path: %s. Error: %s"
+#define FIM_EBPF_HEALTHCHECK_CHMOD_DETAIL           "Could not update file permissions. Path: %s. Error: %s"
+#define FIM_EBPF_HEALTHCHECK_DELETE_DETAIL          "Could not remove the temporary healthcheck file."
+#define FIM_EBPF_HEALTHCHECK_SKIP_DETAIL            "Skipped because the healthcheck file is not available."
 
 /* Wazuh Logtest error messsages */
 #define LOGTEST_ERROR_BIND_SOCK                     "(7300): Unable to bind to socket '%s'. Errno: (%d) %s"
@@ -556,6 +572,7 @@
 #define WM_UPGRADE_UNSIGN_FILE_ERROR                "(8139): At %s: Could not unsign package file '%s'"
 #define WM_UPGRADE_FILE_OPEN_ERROR                  "(8140): At %s: Unable to open '%s'"
 #define WM_UPGRADE_CANNOT_READ                      "(8141): At %s: Unable to read '%s'"
+#define WM_UPGRADE_SYMLINK_REJECTED                 "(8142): At %s: Refused to open '%s': the path is a symbolic link."
 
 #define MOD_TASK_CHECK_DB_ERROR                     "(8250): DB integrity is invalid. Exiting..."
 #define MOD_TASK_CREATE_SOCK_ERROR                  "(8251): Queue '%s' not accessible: '%s'. Exiting..."

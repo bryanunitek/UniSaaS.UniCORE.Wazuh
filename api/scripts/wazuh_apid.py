@@ -177,33 +177,16 @@ def start(params: dict):
                 validate_responses=False
                 )
 
-    # Maximum body size that the API can accept (bytes)
-    if api_conf['access']['max_request_per_minute'] > 0:
-        app.add_middleware(CheckRateLimitsMiddleware, MiddlewarePosition.BEFORE_SECURITY)
-    app.add_middleware(CheckExpectHeaderMiddleware)
-    app.add_middleware(CheckBlockedIP, MiddlewarePosition.BEFORE_SECURITY)
-    app.add_middleware(WazuhAccessLoggerMiddleware, MiddlewarePosition.BEFORE_EXCEPTION)
-    app.add_middleware(SecureHeadersMiddleware, MiddlewarePosition.BEFORE_EXCEPTION)
-    if api_conf['max_upload_size']:
-        app.add_middleware(ContentSizeLimitMiddleware, max_content_size=api_conf['max_upload_size'])
-        app.add_error_handler(ContentSizeExceeded, error_handler.content_size_handler)
-
-    # Enable CORS
-    if api_conf['cors']['enabled']:
-        app.add_middleware(
-            CORSMiddleware,
-            position=MiddlewarePosition.BEFORE_EXCEPTION,
-            allow_origins=api_conf['cors']['source_route'],
-            expose_headers=api_conf['cors']['expose_headers'],
-            allow_headers=api_conf['cors']['allow_headers'],
-            allow_credentials=api_conf['cors']['allow_credentials'],
-        )
+    # The order these are registered in is what keeps an oversized body a 413 rather than a 500.
+    # Every middleware belongs inside setup_middlewares(), never after it -- see its docstring.
+    setup_middlewares(app)
 
     # Display warning if using deprecated cache API configuration
     if api_conf.get('cache', {}).get('enabled', {}):
         logger.warning(CACHE_DELETED_MESSAGE.format(release="4.9.0"))
 
     # Add error handlers to format exceptions
+    app.add_error_handler(ContentSizeExceeded, error_handler.content_size_handler)
     app.add_error_handler(ExpectFailedException, error_handler.expect_failed_error_handler)
     app.add_error_handler(Unauthorized, error_handler.unauthorized_error_handler)
     app.add_error_handler(HTTPException, error_handler.http_error_handler)
@@ -258,10 +241,11 @@ def version():
 
 
 def exit_handler(signum, frame):
-    """Try to kill API child processes and remove their PID files."""
+    """Kill API child processes, remove their PID files and terminate."""
     api_pid = os.getpid()
     pyDaemonModule.delete_child_pids(pyDaemonModule.API_MAIN_PROCESS, api_pid, logger)
     pyDaemonModule.delete_pid(pyDaemonModule.API_MAIN_PROCESS, api_pid)
+    os._exit(0)
 
 
 def add_debug2_log_level_and_error():
@@ -322,11 +306,8 @@ if __name__ == '__main__':
     import uvicorn
     from connexion import AsyncApp
     from connexion.exceptions import HTTPException, ProblemException, Unauthorized
-    from connexion.middleware import MiddlewarePosition
     from connexion.options import SwaggerUIOptions
-    from content_size_limit_asgi import ContentSizeLimitMiddleware
     from content_size_limit_asgi.errors import ContentSizeExceeded
-    from starlette.middleware.cors import CORSMiddleware
     from wazuh.core import common, pyDaemonModule, utils
     from wazuh.rbac.orm import check_database_integrity
 
@@ -336,13 +317,7 @@ if __name__ == '__main__':
     from api.api_exception import APIError, ExpectFailedException
     from api.configuration import api_conf, generate_private_key, generate_self_signed_certificate, security_conf
     from api.constants import API_LOG_PATH
-    from api.middlewares import (
-        CheckBlockedIP,
-        CheckRateLimitsMiddleware,
-        SecureHeadersMiddleware,
-        WazuhAccessLoggerMiddleware,
-        CheckExpectHeaderMiddleware,
-    )
+    from api.middlewares import setup_middlewares
     from api.signals import lifespan_handler
     from api.uri_parser import APIUriParser
     from api.util import to_relative_path

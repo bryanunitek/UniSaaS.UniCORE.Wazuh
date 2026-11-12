@@ -13,6 +13,7 @@
 
 /* Active Response */
 #define AR_SERVER_AGENT "(1306): Invalid agent ID. Use location=server to run AR on the manager."
+#define AR_MAX_COMMANDS "(1307): Defined %d active response commands, more than the %d supported by previous agent versions. Those agents may fail to run active responses until the exceeding entries of '%s' are removed."
 
 /* File integrity monitoring warning messages*/
 #define FIM_WARN_ACCESS                         "(6900): Accessing  '%s': [(%d) - (%s)]"
@@ -77,6 +78,7 @@
 #define FIM_FULL_EBPF_KERNEL_QUEUE              "(6958): Internal ebpf queue for kernel events is full. Too many eBPF events from system files. Next scheduled scan will recover lost data."
 #define FIM_ERROR_EBPF_HEALTHCHECK              "(6959): The eBPF healthcheck has failed. Switching all whodata eBPF configuration to audit."
 #define FIM_WARN_INODE_WRONG_TYPE               "(6960): Inode field received with a wrong type, it must be a string."
+#define FIM_WARN_WHODATA_PROVIDER_UNSUPPORTED   "(6967): The whodata 'provider' option is only available on Linux. Ignoring it."
 
 /* Monitord warning messages */
 #define ROTATE_LOG_LONG_PATH                    "(7500): The path of the rotated log is too long."
@@ -127,6 +129,10 @@
 #define ANALYSISD_EMPTY_SID                     "(7619): Empty 'if_sid' value. Rule '%d' will be ignored."
 #define ANALYSISD_SIG_ID_NOT_FOUND_MID          "(7620): Signature ID '%d' was not found. Invalid 'if_matched_sid'."\
                                                          "Rule '%d' will be ignored."
+#define ANALYSISD_RULE_TREE_NODE_WARNING        "(7621): The rule tree exceeded the warning threshold of %zu nodes " \
+                                                        "while adding rule '%d' from '%s'."
+#define ANALYSISD_RULE_TREE_NO_MEMORY           "(7622): Could not determine the memory size. " \
+                                                        "'analysisd.%s' (%d%%) is disabled."
 
 /* Logcollector */
 #define LOGCOLLECTOR_INV_VALUE_DEFAULT          "(8000): Invalid value '%s' for attribute '%s' in '%s' option. " \
@@ -161,6 +167,7 @@
 #define LOGCOLLECTOR_JOURNAL_CONFG_EMPTY_FILTER_EXPR  "(8020): The expression for the journal filter cannot be empty."
 #define LOGCOLLECTOR_JOURNAL_CONFG_FILTER_EXP_FAIL    "(8021): Error compiling the PCRE2 expression '%s' for field '%s' in journal filter."
 #define LOGCOLLECTOR_JOURNAL_CONFG_DISABLE_FILTER    "(8022): The filters of the journald log will be disabled in the merge, because one of the configuration does not have filters."
+#define LOGCOLLECTOR_STATUS_PARSE_FAIL "(8023): Could not parse the last read positions in '%s'. Files will be read from their end."
 
 /* Remoted */
 #define REMOTED_NET_PROTOCOL_ERROR              "(9000): Error getting protocol. Default value (%s) will be used."

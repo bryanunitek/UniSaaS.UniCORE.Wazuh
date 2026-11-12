@@ -459,6 +459,49 @@ async def async_decompress_files(zip_path, ko_files_name="files_metadata.json"):
     return decompress_files(zip_path, ko_files_name)
 
 
+def decompress_to_file(content, full_path, max_size):
+    """Decompress a single archive member to disk, bounding the decompressed size.
+
+    The compressed content is decompressed in fixed-size chunks that are written to disk
+    as they are produced, so the peak memory usage is limited to one chunk regardless of
+    the decompressed size. This prevents a peer-supplied member from forcing the whole
+    decompressed payload to be materialised in memory at once. If the decompressed output
+    exceeds 'max_size', or the compressed stream is truncated or corrupted, an exception is
+    raised; the partial output is cleaned up by the caller.
+
+    Parameters
+    ----------
+    content : bytes
+        Compressed content of the archive member.
+    full_path : str
+        Destination path where the decompressed content is written.
+    max_size : int
+        Maximum allowed decompressed size, in bytes.
+
+    Returns
+    -------
+    int
+        Number of decompressed bytes written.
+    """
+    decompressor = zlib.decompressobj()
+    chunk_size = 1024 * 1024  # 1 MiB
+    total = 0
+    with open(full_path, 'wb') as f:
+        chunk = decompressor.decompress(content, chunk_size)
+        while chunk:
+            total += len(chunk)
+            if total > max_size:
+                raise WazuhInternalError(3053)
+            f.write(chunk)
+            chunk = decompressor.decompress(decompressor.unconsumed_tail, chunk_size)
+        # A complete zlib stream sets 'eof' after its trailing checksum is validated.
+        # Reject truncated or corrupted members, mirroring the check zlib.decompress() does.
+        if not decompressor.eof:
+            raise zlib.error('Error -5 while decompressing data: incomplete or truncated stream')
+
+    return total
+
+
 def decompress_files(compress_path, ko_files_name="files_metadata.json"):
     """Decompress files in a directory and load the files_metadata.json as a dict.
 
@@ -483,6 +526,8 @@ def decompress_files(compress_path, ko_files_name="files_metadata.json"):
     compressed_data = b''
     window_size = 1024 * 1024 * 10  # 10 MiB
     decompress_dir = compress_path + 'dir'
+    max_zip_size = get_cluster_items()['intervals']['communication']['max_zip_size']
+    total_decompressed = 0
 
     try:
         mkdir_with_mode(decompress_dir)
@@ -498,7 +543,6 @@ def decompress_files(compress_path, ko_files_name="files_metadata.json"):
 
                 for file in files:
                     filepath, content = file.split(PATH_SEP.encode(), 1)
-                    content = zlib.decompress(content)
                     full_path = safe_join(decompress_dir, filepath.decode())
                     if not os.path.exists(os.path.dirname(full_path)):
                         try:
@@ -506,8 +550,10 @@ def decompress_files(compress_path, ko_files_name="files_metadata.json"):
                         except OSError as exc:  # Guard against race condition
                             if exc.errno != errno.EEXIST:
                                 raise
-                    with open(full_path, 'wb') as f:
-                        f.write(content)
+                    # Bound the aggregate decompressed size across all members, not just per
+                    # member, so an archive cannot exceed max_zip_size by stacking entries.
+                    total_decompressed += decompress_to_file(content, full_path,
+                                                             max_zip_size - total_decompressed)
 
                 if not new_data:
                     break
@@ -649,7 +695,8 @@ def clean_up(node_name=""):
                 continue
 
     try:
-        rm_path = path.join(common.WAZUH_PATH, 'queue', 'cluster', node_name)
+        cluster_base = path.join(common.WAZUH_PATH, 'queue', 'cluster')
+        rm_path = safe_join(cluster_base, node_name)
         logger.debug(f"Removing '{rm_path}'.")
         remove_directory_contents(rm_path)
         logger.debug(f"Removed '{rm_path}'.")
@@ -737,7 +784,18 @@ def unmerge_info(merge_type, path_file, filename):
         Content of the splitted file.
     st_mtime : str
         Modification time of the splitted file.
+
+    Raises
+    ------
+    WazuhClusterError
+        If parameters contain invalid characters.
     """
+    if '/' in merge_type or '\\' in merge_type or merge_type.startswith('.'):
+        raise WazuhException(3052, extra_message=f"Invalid merge_type: {merge_type}")
+
+    if '/' in filename or '\\' in filename or filename.startswith('.'):
+        raise WazuhException(3052, extra_message=f"Invalid merge filename: {filename}")
+
     src_path = path.abspath(path.join(path_file, filename))
     dst_path = path.join("queue", merge_type)
 
@@ -756,6 +814,13 @@ def unmerge_info(merge_type, path_file, filename):
                 break
 
             # read data
+            name = path.basename(name)
+            if not name or name.startswith('.') or '/' in name or '\\' in name:
+                logger.warning(f"Invalid filename in merged header: {name}. Skipping.")
+                src_f.read(st_size)
+                bytes_read += st_size
+                continue
+
             data = src_f.read(st_size)
             bytes_read += st_size
 

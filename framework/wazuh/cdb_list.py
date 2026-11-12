@@ -3,7 +3,7 @@
 # This program is free software; you can redistribute it and/or modify it under the terms of GPLv2
 
 from os import remove
-from os.path import join, split, exists, isfile, dirname as path_dirname
+from os.path import join, split, exists, isfile, dirname as path_dirname, realpath, commonpath
 
 from wazuh.core import common
 from wazuh.core.cdb_list import iterate_lists, get_list_from_file, REQUIRED_FIELDS, SORT_FIELDS, delete_list, \
@@ -61,8 +61,10 @@ def get_lists(filename: list = None, offset: int = 0, limit: int = common.DATABA
 
     lists = list()
     for path in get_filenames_paths(filename):
-        # Only files which exist and whose dirname is the one specified by the user (if any), will be added to response.
-        if not any([dirname is not None and path_dirname(path) != dirname, not isfile(path)]):
+        # Only files which exist, stay inside the lists directory and whose dirname is the one specified by the
+        # user (if any), will be added to response.
+        if not any([dirname is not None and path_dirname(path) != dirname, not isfile(path),
+                    commonpath([realpath(path), realpath(common.USER_LISTS_PATH)]) != realpath(common.USER_LISTS_PATH)]):
             lists.append({'items': [{'key': key, 'value': value} for key, value in get_list_from_file(path).items()],
                           'relative_dirname': path_dirname(to_relative_path(path)),
                           'filename': split(to_relative_path(path))[1]})
@@ -98,7 +100,11 @@ def get_list_file(filename: list = None, raw: bool = None) -> AffectedItemsWazuh
 
     try:
         # Recursively search for filename inside {wazuh_path}/etc/lists/
-        content = get_list_from_file(get_filenames_paths(filename)[0], raw)
+        full_path = get_filenames_paths(filename)[0]
+        # Ensure the resolved path stays inside the lists directory.
+        if commonpath([realpath(full_path), realpath(common.USER_LISTS_PATH)]) != realpath(common.USER_LISTS_PATH):
+            raise WazuhError(1804, extra_message=f"{filename[0]} is outside the lists directory")
+        content = get_list_from_file(full_path, raw)
         if raw:
             result = content
         else:
@@ -140,6 +146,9 @@ def upload_list_file(filename: str = None, content: str = None, overwrite: bool 
         # If file already exists and overwrite is False, raise exception.
         if not overwrite and exists(full_path):
             raise WazuhError(1905)
+        # If filename resolves outside the lists directory (path traversal).
+        elif commonpath([realpath(full_path), realpath(common.USER_LISTS_PATH)]) != realpath(common.USER_LISTS_PATH):
+            raise WazuhError(1805)
         # If file with same name already exists in subdirectory.
         elif get_filenames_paths([filename])[0] != full_path:
             raise WazuhError(1805)
@@ -182,6 +191,9 @@ def delete_list_file(filename: list) -> AffectedItemsWazuhResult:
     full_path = join(common.USER_LISTS_PATH, filename[0])
 
     try:
+        # Ensure the resolved path stays inside the lists directory.
+        if commonpath([realpath(full_path), realpath(common.USER_LISTS_PATH)]) != realpath(common.USER_LISTS_PATH):
+            raise WazuhError(1804, extra_message=f"{filename[0]} is outside the lists directory")
         delete_list(to_relative_path(full_path))
 
         result.affected_items.append(to_relative_path(full_path))

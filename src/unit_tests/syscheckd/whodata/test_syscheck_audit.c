@@ -1167,6 +1167,54 @@ void test_audit_read_events_select_success_recv_error_audit_reconnect(void **sta
     audit_read_events(audit_sock, &audit_thread_active);
 }
 
+void test_audit_reconnect_with_retries_success(void **state) {
+    (void) state;
+    int audit_sock = -1;
+    char merror_msg[OS_SIZE_128] = {0};
+    snprintf(merror_msg, OS_SIZE_128, FIM_ERROR_WHODATA_SOCKET_CONNECT, AUDIT_SOCKET);
+
+    // First init_auditd_socket() attempt fails
+    expect_any(__wrap_OS_ConnectUnixDomain, path);
+    expect_any(__wrap_OS_ConnectUnixDomain, type);
+    expect_any(__wrap_OS_ConnectUnixDomain, max_msg_size);
+    will_return(__wrap_OS_ConnectUnixDomain, -1);
+    expect_string(__wrap__merror, formatted_msg, merror_msg);
+
+    // Retry sleeps, logs the reconnect and succeeds
+    expect_value(__wrap_sleep, seconds, 1);
+    expect_any(__wrap__minfo, formatted_msg);
+    expect_any(__wrap_OS_ConnectUnixDomain, path);
+    expect_any(__wrap_OS_ConnectUnixDomain, type);
+    expect_any(__wrap_OS_ConnectUnixDomain, max_msg_size);
+    will_return(__wrap_OS_ConnectUnixDomain, 124);
+
+    assert_int_equal(audit_reconnect_with_retries(&audit_sock), 124);
+    assert_int_equal(audit_sock, 124);
+}
+
+void test_audit_reconnect_with_retries_exhausted(void **state) {
+    (void) state;
+    int audit_sock = -1;
+    char merror_msg[OS_SIZE_128] = {0};
+    snprintf(merror_msg, OS_SIZE_128, FIM_ERROR_WHODATA_SOCKET_CONNECT, AUDIT_SOCKET);
+
+    // 1 initial attempt + MAX_CONN_RETRIES retries, all failing -> returns -1
+    for (int i = 0; i <= MAX_CONN_RETRIES; i++) {
+        if (i > 0) {
+            expect_value(__wrap_sleep, seconds, 1);
+            expect_any(__wrap__minfo, formatted_msg);
+        }
+        expect_any(__wrap_OS_ConnectUnixDomain, path);
+        expect_any(__wrap_OS_ConnectUnixDomain, type);
+        expect_any(__wrap_OS_ConnectUnixDomain, max_msg_size);
+        will_return(__wrap_OS_ConnectUnixDomain, -1);
+        expect_string(__wrap__merror, formatted_msg, merror_msg);
+    }
+
+    assert_int_equal(audit_reconnect_with_retries(&audit_sock), -1);
+    assert_int_equal(audit_sock, -1);
+}
+
 void test_audit_read_events_select_success_recv_success(void **state) {
     (void) state;
     int *audit_sock = *state;
@@ -1307,6 +1355,44 @@ void test_audit_read_events_select_success_recv_success_too_long(void **state) {
     audit_read_events(audit_sock, &audit_thread_active);
 
     os_free(buffer);
+}
+
+void test_audit_read_events_select_success_recv_success_cache_boundary(void **state) {
+    int *audit_sock = *state;
+    audit_thread_active.data = 1;
+
+    expect_value_count(__wrap_atomic_int_get, atomic, &audit_thread_active, 4);
+    will_return_count(__wrap_atomic_int_get, 1, 4);
+
+    expect_value(__wrap_atomic_int_get, atomic, &audit_thread_active);
+    will_return(__wrap_atomic_int_get, 0);
+
+    char *line1 = "type=SYSCALL msg=audit(1571914029.306:3004254): a\n";
+
+    // Second line fills the cache up to its last byte, leaving no room for the terminator
+    size_t len2 = OS_MAXSTR - 1 - strlen(line1);
+    char *line2 = malloc(len2 + 2);
+    memset(line2, 'a', len2);
+    const char *hdr2 = "type=CWD msg=audit(1571914029.306:3004254): ";
+    memcpy(line2, hdr2, strlen(hdr2));
+    line2[len2] = '\n';
+    line2[len2 + 1] = '\0';
+
+    will_return(__wrap_select, 1);
+    expect_value(__wrap_recv, __fd, *audit_sock);
+    will_return(__wrap_recv, strlen(line1));
+    will_return(__wrap_recv, line1);
+
+    will_return(__wrap_select, 1);
+    expect_value(__wrap_recv, __fd, *audit_sock);
+    will_return(__wrap_recv, strlen(line2));
+    will_return(__wrap_recv, line2);
+
+    expect_string(__wrap__mwarn, formatted_msg, "(6929): Caching Audit message: event too long. Event with ID: '1571914029.306:3004254' will be discarded.");
+
+    audit_read_events(audit_sock, &audit_thread_active);
+
+    os_free(line2);
 }
 
 void test_audit_parse_thread(void **state) {
@@ -1697,10 +1783,13 @@ int main(void) {
         cmocka_unit_test_setup_teardown(test_audit_read_events_select_case_0, test_audit_read_events_setup, test_audit_read_events_teardown),
         cmocka_unit_test_setup_teardown(test_audit_read_events_select_success_recv_error_audit_connection_closed, test_audit_read_events_setup, test_audit_read_events_teardown),
         cmocka_unit_test_setup_teardown(test_audit_read_events_select_success_recv_error_audit_reconnect, test_audit_read_events_setup, test_audit_read_events_teardown),
+        cmocka_unit_test(test_audit_reconnect_with_retries_success),
+        cmocka_unit_test(test_audit_reconnect_with_retries_exhausted),
         cmocka_unit_test_setup_teardown(test_audit_read_events_select_success_recv_success, test_audit_read_events_setup, test_audit_read_events_teardown),
         cmocka_unit_test_setup_teardown(test_audit_read_events_select_success_recv_success_no_endline, test_audit_read_events_setup, test_audit_read_events_teardown),
         cmocka_unit_test_setup_teardown(test_audit_read_events_select_success_recv_success_no_id, test_audit_read_events_setup, test_audit_read_events_teardown),
         cmocka_unit_test_setup_teardown(test_audit_read_events_select_success_recv_success_too_long, test_audit_read_events_setup, test_audit_read_events_teardown),
+        cmocka_unit_test_setup_teardown(test_audit_read_events_select_success_recv_success_cache_boundary, test_audit_read_events_setup, test_audit_read_events_teardown),
         cmocka_unit_test(test_audit_parse_thread),
         cmocka_unit_test_setup_teardown(test_audit_rules_to_realtime, setup_syscheck_dir_links, teardown_rules_to_realtime),
         cmocka_unit_test_setup_teardown(test_audit_rules_to_realtime_first_search_audit_rule_fail, setup_syscheck_dir_links, teardown_rules_to_realtime),

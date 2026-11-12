@@ -13,7 +13,7 @@ import struct
 import sys
 from contextvars import ContextVar
 from datetime import datetime
-from unittest.mock import patch, MagicMock, call, ANY, AsyncMock, mock_open
+from unittest.mock import patch, MagicMock, Mock, call, ANY, AsyncMock, mock_open
 
 import cryptography
 import pytest
@@ -131,7 +131,8 @@ def test_inbuffer_get_info_from_header(unpack_mock):
     # If the flag value is the same as divide_flag, we will forward this value to the flag_divided attribute.
     assert in_buffer.cmd == b"pw"
     assert in_buffer.flag_divided == b"d"
-    assert in_buffer.payload == bytearray(in_buffer.total)
+    # Payload starts empty; memory is committed only as bytes arrive (lazy allocation).
+    assert in_buffer.payload == bytearray()
 
     unpack_mock.return_value = (0, 2048, b'echo')
     in_buffer.get_info_from_header(b"header", "hhl", 1)
@@ -171,6 +172,69 @@ def test_inbuffer_receive_data():
 
     assert isinstance(in_buffer.receive_data(b"data"), bytes)
     assert in_buffer.received == 1028
+
+
+def test_inbuffer_lazy_allocation():
+    """Validate that get_info_from_header does not pre-allocate the full declared payload.
+
+    A peer can declare any size up to MAX_TOTAL_SIZE.  Memory must only be
+    committed as bytes actually arrive, so that a connection that sends only
+    the 20-byte header cannot pin the full declared amount.
+    """
+    buf = cluster_common.InBuffer()
+    # Simulate parsing a header that declares the maximum allowed payload size.
+    with patch('struct.unpack', return_value=(1, cluster_common.MAX_TOTAL_SIZE, b'cmd---------')):
+        buf.get_info_from_header(b'x' * 20, '!2I12s', 20)
+
+    # Payload buffer must be empty immediately after header parsing — no pre-allocation.
+    assert buf.total == cluster_common.MAX_TOTAL_SIZE
+    assert len(buf.payload) == 0
+
+    # After receiving some bytes the payload grows by exactly that amount.
+    remaining = buf.receive_data(b'hello')
+    assert len(buf.payload) == 5
+    assert buf.received == 5
+    assert remaining == b''
+
+
+@pytest.mark.asyncio
+async def test_handler_payload_deadline_fires():
+    """Validate that a connection is closed if declared payload bytes never arrive.
+
+    The deadline must fire after PRE_AUTH_PAYLOAD_TIMEOUT and call
+    transport.close() so memory for the outstanding payload is released.
+    """
+    handler = cluster_common.Handler(fernet_key, cluster_items)
+    transport_mock = Mock()
+    handler.transport = transport_mock
+
+    handler._start_payload_deadline()
+    assert handler._payload_deadline is not None
+
+    # Advance the event loop past the deadline.
+    await asyncio.sleep(cluster_common.PRE_AUTH_PAYLOAD_TIMEOUT + 0.1)
+
+    transport_mock.close.assert_called_once()
+    # Timer handle is consumed once it fires.
+    assert handler._payload_deadline is None
+
+
+@pytest.mark.asyncio
+async def test_handler_payload_deadline_cancelled_on_complete():
+    """Validate that the deadline is cancelled once the full payload arrives."""
+    handler = cluster_common.Handler(fernet_key, cluster_items)
+    transport_mock = Mock()
+    handler.transport = transport_mock
+
+    handler._start_payload_deadline()
+    assert handler._payload_deadline is not None
+
+    handler._cancel_payload_deadline()
+    assert handler._payload_deadline is None
+
+    # Give the loop a turn — transport must not be closed.
+    await asyncio.sleep(0)
+    transport_mock.close.assert_not_called()
 
 
 # Test SendStringTask methods
@@ -1493,24 +1557,19 @@ def test_wazuh_common_end_receiving_file_ok(logger_mock, wazuh_common_mock):
         with patch('asyncio.create_task'):
             file_task = cluster_common.ReceiveFileTask(wazuh_common_mock, logger_mock, b"task")
 
-    wazuh_common.sync_tasks = {'task_ID': file_task}
-    assert wazuh_common.end_receiving_file("task_ID filepath") == (b'ok', b'File correctly received')
-    assert isinstance(wazuh_common.sync_tasks["task_ID"], cluster_common.ReceiveFileTask)
+    with patch('wazuh.core.cluster.common.WazuhCommon.get_logger'):
+        wazuh_common.sync_tasks = {'task_ID': file_task}
+        # Use a path within queue/cluster to pass validation
+        assert wazuh_common.end_receiving_file("task_ID queue/cluster/filepath") == (b'ok', b'File correctly received')
+        assert isinstance(wazuh_common.sync_tasks["task_ID"], cluster_common.ReceiveFileTask)
 
 
-@patch('os.remove')
-@patch('os.path.exists', return_value=True)
-def test_wazuh_common_end_receiving_file_ko(path_exists_mock, os_remove_mock):
+def test_wazuh_common_end_receiving_file_ko():
     """Test the 'end_receiving_file' correct functioning in a failure scenario."""
-
-    with pytest.raises(exception.WazuhClusterError, match=r'.* 3027 .*'):
-        wazuh_common.end_receiving_file("not_task_ID filepath")
 
     with patch('wazuh.core.cluster.common.WazuhCommon.get_logger'):
         with pytest.raises(exception.WazuhClusterError, match=r'.* 3027 .*'):
-            os_remove_mock.side_effect = Exception
-            wazuh_common.end_receiving_file("not_task_ID filepath")
-    assert os_remove_mock.call_count == 2
+            wazuh_common.end_receiving_file("not_task_ID queue/cluster/filepath")
 
 
 @patch('json.loads')
@@ -1535,6 +1594,61 @@ def test_wazuh_common_error_receiving_file_ko():
             with patch('os.remove', side_effect=Exception):
                 with patch('wazuh.core.cluster.common.WazuhCommon.get_logger'):
                     assert wazuh_common.error_receiving_file("task_ID error_details") == (b'ok', b'Error received')
+
+
+def test_wazuh_common_end_receiving_file_invalid_absolute_path():
+    """Test that end_receiving_file rejects absolute paths."""
+
+    with patch('wazuh.core.cluster.common.WazuhCommon.get_logger'):
+        with pytest.raises(exception.WazuhClusterError, match=r'.* 3027 .*'):
+            wazuh_common.end_receiving_file("not_task_ID /etc/passwd")
+
+
+def test_wazuh_common_end_receiving_file_invalid_relative_path():
+    """Test that end_receiving_file rejects paths outside allowed prefix."""
+
+    with patch('wazuh.core.cluster.common.WazuhCommon.get_logger'):
+        with pytest.raises(exception.WazuhClusterError, match=r'.* 3027 .*'):
+            wazuh_common.end_receiving_file("not_task_ID ../../../../etc/passwd")
+
+
+def test_wazuh_common_end_receiving_file_invalid_nested_path():
+    """Test that end_receiving_file validates nested path components."""
+
+    with patch('wazuh.core.cluster.common.WazuhCommon.get_logger'):
+        with pytest.raises(exception.WazuhClusterError, match=r'.* 3027 .*'):
+            wazuh_common.end_receiving_file("not_task_ID ../../../tmp/evil.sh")
+
+
+@patch('os.path.exists', return_value=False)
+def test_wazuh_common_end_receiving_file_path_validation_with_valid_task(path_exists_mock):
+    """Test that path validation is applied regardless of task_id validity."""
+
+    from unittest.mock import MagicMock
+
+    with patch('wazuh.core.cluster.common.ReceiveFileTask.set_up_coro'):
+        with patch('asyncio.create_task'):
+            with patch('wazuh.core.cluster.common.WazuhCommon.get_logger'):
+                file_task = cluster_common.ReceiveFileTask(wazuh_common, MagicMock(), b"task")
+
+    wazuh_common.sync_tasks = {'valid_task_id': file_task}
+
+    with patch('wazuh.core.cluster.common.WazuhCommon.get_logger'):
+        with pytest.raises(exception.WazuhClusterError, match=r'.* 3027 .*'):
+            wazuh_common.end_receiving_file("valid_task_id /etc/passwd")
+
+
+@patch('os.remove')
+@patch('os.path.exists', return_value=True)
+def test_wazuh_common_end_receiving_file_no_deletion_on_invalid_task(path_exists_mock, os_remove_mock):
+    """Test that no file deletion occurs when task_id is not found (CVE fix)."""
+
+    with patch('wazuh.core.cluster.common.WazuhCommon.get_logger'):
+        # Attempt to use end_receiving_file with non-existent task_id
+        with pytest.raises(exception.WazuhClusterError, match=r'.* 3027 .*'):
+            wazuh_common.end_receiving_file("non_existent_task /var/wazuh-manager/api/configuration/security/rbac.db")
+
+        assert os_remove_mock.call_count == 0, "File deletion should not occur when task_id is not found"
 
 
 def test_wazuh_common_get_node():
@@ -2156,7 +2270,7 @@ async def test_sync_files_sync_ko(send_request_mock):
         with patch("wazuh.core.cluster.cluster.compress_files", return_value=(compressed_data, {})):
             send_request_mock.side_effect = None
             logger = logging.getLogger('wazuh')
-            with patch.object(logger, "error") as logger_mock:
+            with patch.object(logger, "warning") as logger_mock:
                 await sync_files.sync(files_to_sync, files_metadata, 1, task_pool=None)
                 logger_mock.assert_called_with(f"File {compressed_data} could not be removed/not found. "
                                                f"May be due to a lost connection.")

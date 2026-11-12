@@ -13,6 +13,7 @@
 #include "state.h"
 #include "remoted_op.h"
 #include "../wazuh_db/helpers/wdb_global_helpers.h"
+#include "../wazuh_db/wdb.h"
 #include "../os_net/os_net.h"
 #include "shared_download.h"
 #include "../os_crypto/sha256/sha256_op.h"
@@ -494,6 +495,11 @@ void save_controlmsg(const keyentry * key, char *r_msg, int *wdb_sock, bool *pos
 
             os_strdup(msg, data->message);
 
+            /* Snapshot of the last merged_sum reported by the agent, used after
+             * unlocking to detect changes (e.g. after a hot reload). */
+            os_md5 prev_reported_merged_sum;
+            memcpy(prev_reported_merged_sum, data->last_reported_merged_sum, sizeof(os_md5));
+
             if (OS_SUCCESS == lookfor_agent_group(key->id, data->message, &data->group, wdb_sock)) {
                 group_t *aux = NULL;
 
@@ -554,13 +560,29 @@ void save_controlmsg(const keyentry * key, char *r_msg, int *wdb_sock, bool *pos
                 wm_strcat(&agent_data->labels, agent_data->version, 0);
             }
 
+            /* Detect a change in the merged_sum reported by the agent versus the
+             * previous keepalive. After a hot reload the agent does not send
+             * #!-agent startup, so on worker nodes the cluster sync would only
+             * propagate {id, last_keepalive} (syncreq_keepalive) and the master DB
+             * would keep the stale merged_sum. Escalating to syncreq triggers a
+             * full sync that includes merged_sum and group_config_status. */
+            bool agent_merged_sum_changed = agent_data->merged_sum &&
+                                            agent_data->merged_sum[0] &&
+                                            prev_reported_merged_sum[0] &&
+                                            strcmp(prev_reported_merged_sum, agent_data->merged_sum) != 0;
+
             agent_data->id = atoi(key->id);
             os_strdup(AGENT_CS_ACTIVE, agent_data->connection_status);
-            os_strdup(logr.worker_node ? (*post_startup ? "syncreq" : "syncreq_keepalive") : "synced", agent_data->sync_status);
+            os_strdup(logr.worker_node ? ((*post_startup || agent_merged_sum_changed) ? "syncreq" : "syncreq_keepalive") : "synced", agent_data->sync_status);
 
             *post_startup = false;
 
             w_mutex_lock(&lastmsg_mutex);
+
+            if (agent_data->merged_sum && agent_data->merged_sum[0]) {
+                strncpy(data->last_reported_merged_sum, agent_data->merged_sum, sizeof(os_md5) - 1);
+                data->last_reported_merged_sum[sizeof(os_md5) - 1] = '\0';
+            }
 
             if (data->merged_sum[0] && (!agent_data->merged_sum || (strcmp(data->merged_sum, agent_data->merged_sum) != 0))) {
                 /* Mark data as changed and insert into queue */
@@ -1180,7 +1202,7 @@ STATIC void process_deleted_multi_groups(bool initial_scan) {
             multigroup->exists = false;
         } else {
             OS_SHA256_String(multigroup->name, multi_group_hash);
-            snprintf(multi_path, PATH_MAX,"%s/%.8s", MULTIGROUPS_DIR, multi_group_hash);
+            snprintf(multi_path, PATH_MAX,"%s/%.*s", MULTIGROUPS_DIR, WDB_GROUP_HASH_SIZE, multi_group_hash);
             rmdir_ex(multi_path);
             OSHash_Delete_ex(multi_groups, key);
             OSHash_Clean(multigroup->f_time, free_file_time);
@@ -1641,7 +1663,7 @@ static int send_file_toagent(const char *agent_id, const char *group, const char
     /* Check if it is multigroup */
     if (strchr(group, MULTIGROUP_SEPARATOR)) {
         OS_SHA256_String(group, multi_group_hash);
-        snprintf(file, OS_SIZE_1024, "%s/%.8s/%s", sharedcfg_dir, multi_group_hash, name);
+        snprintf(file, OS_SIZE_1024, "%s/%.*s/%s", sharedcfg_dir, WDB_GROUP_HASH_SIZE, multi_group_hash, name);
     } else {
         snprintf(file, OS_SIZE_1024, "%s/%s/%s", sharedcfg_dir, group, name);
     }

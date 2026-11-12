@@ -132,10 +132,10 @@ checks:
       - pci_dss_v3.2.1: ["6.2"]
       - pci_dss_v4.0: ["11.3.1", "11.3.2", "11.3.2.1"]
       - soc_2: ["CC7.1"]
-    condition: any
+    condition: all
     rules:
-      - 'c:osascript -l JavaScript -e "$.NSUserDefaults.alloc.initWithSuiteName(''com.apple.SoftwareUpdate'').objectForKey(''ConfigDataInstall'')" && c:osascript -l JavaScript -e "$.NSUserDefaults.alloc.initWithSuiteName(''com.apple.SoftwareUpdate'').objectForKey(''CriticalUpdateInstall'')" -> r:^1$'
-      - 'not c:osascript -l JavaScript -e "$.NSUserDefaults.alloc.initWithSuiteName(''com.apple.SoftwareUpdate'').objectForKey(''ConfigDataInstall'')" && c:osascript -l JavaScript -e "$.NSUserDefaults.alloc.initWithSuiteName(''com.apple.SoftwareUpdate'').objectForKey(''CriticalUpdateInstall'')" -> r:\.+'
+      - 'c:osascript -l JavaScript -e "$.NSUserDefaults.alloc.initWithSuiteName(''com.apple.SoftwareUpdate'').objectForKey(''ConfigDataInstall'')" -> r:^1$'
+      - 'c:osascript -l JavaScript -e "$.NSUserDefaults.alloc.initWithSuiteName(''com.apple.SoftwareUpdate'').objectForKey(''CriticalUpdateInstall'')" -> r:^1$'
 
   # 1.7 Ensure Software Update Deferment Is Less Than or Equal to 30 Days. (Automated)
   - id: 30005
@@ -619,7 +619,7 @@ checks:
       - soc_2: ["CC7.1", "CC8.1"]
     condition: all
     rules:
-      - "c:security authorizationdb read system.preferences | grep -A1 shared -> r:>false<"
+      - 'c:sh -c "security authorizationdb read system.preferences | grep -A1 shared" -> r:>false<'
 
   # 2.7.1 Ensure Screen Saver Corners Are Secure. (Automated) - Not Implemented
   # 2.8.1 Audit Universal Control Settings. (Manual) - Not Implemented
@@ -958,14 +958,14 @@ checks:
       - soc_2: ["A1.1"]
     condition: any
     rules:
-      - 'f:/etc/security/audit_control -> n:^expire-after:\s*(\d+)s OR \d+\w compare => 5184000'
-      - 'f:/etc/security/audit_control -> n:^expire-after:\s*(\d+)h OR \d+\w compare => 1440'
-      - 'f:/etc/security/audit_control -> n:^expire-after:\s*(\d+)d OR \d+\w compare => 60'
-      - 'f:/etc/security/audit_control -> n:^expire-after:\s*(\d+)y OR \d+\w compare => 1'
-      - 'f:/etc/security/audit_control -> n:^expire-after:\s*\d+\w OR (\d+)b compare => 5368709120'
-      - 'f:/etc/security/audit_control -> n:^expire-after:\s*\d+\w OR (\d+)k compare => 5242880'
-      - 'f:/etc/security/audit_control -> n:^expire-after:\s*\d+\w OR (\d+)m compare => 5120'
-      - 'f:/etc/security/audit_control -> n:^expire-after:\s*\d+\w OR (\d+)g compare => 5'
+      - 'f:/etc/security/audit_control -> n:^expire-after:\s*(\d+)s OR \d+\w compare >= 5184000'
+      - 'f:/etc/security/audit_control -> n:^expire-after:\s*(\d+)h OR \d+\w compare >= 1440'
+      - 'f:/etc/security/audit_control -> n:^expire-after:\s*(\d+)d OR \d+\w compare >= 60'
+      - 'f:/etc/security/audit_control -> n:^expire-after:\s*(\d+)y OR \d+\w compare >= 1'
+      - 'f:/etc/security/audit_control -> n:^expire-after:\s*\d+\w OR (\d+)b compare >= 5368709120'
+      - 'f:/etc/security/audit_control -> n:^expire-after:\s*\d+\w OR (\d+)k compare >= 5242880'
+      - 'f:/etc/security/audit_control -> n:^expire-after:\s*\d+\w OR (\d+)m compare >= 5120'
+      - 'f:/etc/security/audit_control -> n:^expire-after:\s*\d+\w OR (\d+)g compare >= 5'
 
   # 3.5 Ensure Access to Audit Records Is Controlled. (Automated) - Not Implemented
   # 3.6 Ensure Firewall Logging Is Enabled and Configured. (Automated) - Not Implemented
@@ -1376,7 +1376,7 @@ checks:
     condition: all
     rules:
       - "d:/Library/Security -> r:^PolicyBanner"
-      - 'c:stat -f %A /Library/Security/PolicyBanner.* -> r:\d\d4'
+      - 'c:sh -c "stat -f %A /Library/Security/PolicyBanner.*" -> r:\d\d4'
 
   # 5.9 Ensure Legacy EFI Is Valid and Updating. (Automated) - Not Implemented
 

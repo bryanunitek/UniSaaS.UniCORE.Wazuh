@@ -64,20 +64,146 @@ async def test_AbstractServerHandler_to_dict(event_loop):
 def test_AbstractServerHandler_connection_made(event_loop):
     """Check that the connection_made function correctly assigns the IP and the transport."""
 
+    class ServerMock:
+        def __init__(self):
+            self.connection_counts = {}
+            self.total_connections = 0
+
     def get_extra_info(self, name):
         return ["peername", "mock"]
 
     transport = Transport()
     logger = Logger("test_connection_made")
+    server_mock = ServerMock()
     with patch("logging.getLogger", return_value=logger):
         with patch.object(logger, "info") as mock_logger:
-            abstract_server_handler = AbstractServerHandler(server="Test", loop=event_loop, fernet_key=fernet_key,
+            abstract_server_handler = AbstractServerHandler(server=server_mock, loop=event_loop,
+                                                            fernet_key=fernet_key,
                                                             cluster_items={"test": "server"})
             with patch.object(asyncio.Transport, "get_extra_info", get_extra_info):
                 abstract_server_handler.connection_made(transport=transport)
                 assert abstract_server_handler.ip == "peername"
                 assert abstract_server_handler.transport == transport
+                assert abstract_server_handler._counted_connection is True
+                assert server_mock.connection_counts == {"peername": 1}
+                assert server_mock.total_connections == 1
                 mock_logger.assert_called_once_with("Connection from ['peername', 'mock']")
+
+    # Verify that a second handler from the same IP up to the limit is accepted,
+    # and that a connection that exceeds MAX_CONNECTIONS_PER_IP is rejected.
+    with patch("logging.getLogger", return_value=logger):
+        server_mock2 = ServerMock()
+        server_mock2.connection_counts = {"1.2.3.4": MAX_CONNECTIONS_PER_IP}
+
+        rejected_handler = AbstractServerHandler(server=server_mock2, loop=event_loop,
+                                                 fernet_key=fernet_key,
+                                                 cluster_items={"test": "server"})
+        mock_transport = Mock()
+        mock_transport.get_extra_info = lambda name: ["1.2.3.4", 9999]
+        rejected_handler.connection_made(transport=mock_transport)
+        mock_transport.close.assert_called_once()
+        assert rejected_handler._counted_connection is False
+        # Count must not have been incremented for the rejected connection.
+        assert server_mock2.connection_counts["1.2.3.4"] == MAX_CONNECTIONS_PER_IP
+        assert server_mock2.total_connections == 0
+
+
+def test_AbstractServerHandler_connection_made_total_limit(event_loop):
+    """Check that a connection is rejected when the global connection limit is reached."""
+
+    class ServerMock:
+        def __init__(self):
+            self.connection_counts = {}
+            self.total_connections = MAX_TOTAL_CONNECTIONS
+
+    logger = Logger("test_connection_made_total_limit")
+    server_mock = ServerMock()
+    with patch("logging.getLogger", return_value=logger):
+        handler = AbstractServerHandler(server=server_mock, loop=event_loop, fernet_key=fernet_key,
+                                        cluster_items={"test": "server"})
+        transport = Mock()
+        transport.get_extra_info = lambda name: ["5.6.7.8", 9999]
+        handler.connection_made(transport=transport)
+
+        transport.close.assert_called_once()
+        assert handler._counted_connection is False
+        # A source IP under its own limit must not be counted when the global limit is reached.
+        assert server_mock.connection_counts == {}
+        assert server_mock.total_connections == MAX_TOTAL_CONNECTIONS
+        assert handler._handshake_deadline is None
+
+
+def test_AbstractServerHandler_handshake_deadline(event_loop):
+    """Check that a connection that never completes the handshake is closed by the deadline."""
+
+    class ServerMock:
+        def __init__(self):
+            self.connection_counts = {}
+            self.total_connections = 0
+            self.clients = {}
+            self.configuration = {"node_name": "master"}
+
+    logger = Logger("test_handshake_deadline")
+    with patch("logging.getLogger", return_value=logger):
+        handler = AbstractServerHandler(server=ServerMock(), loop=event_loop, fernet_key=fernet_key,
+                                        cluster_items={"test": "server"})
+        assert handler._handshake_deadline is None
+
+        handler.loop = Mock()
+        transport = Mock()
+        transport.get_extra_info = lambda name: ["1.2.3.4", 9999]
+        handler.connection_made(transport=transport)
+
+        # The deadline is armed as soon as the connection is accepted.
+        handler.loop.call_later.assert_called_once_with(c_common.PRE_AUTH_PAYLOAD_TIMEOUT,
+                                                        handler._close_on_handshake_deadline)
+        assert handler._handshake_deadline is not None
+
+        # A connection with no completed handshake is closed when the deadline expires.
+        handler._close_on_handshake_deadline()
+        transport.close.assert_called_once()
+        assert handler._handshake_deadline is None
+
+        # A connection that completed the handshake is not closed.
+        handler.name = "worker1"
+        transport.close.reset_mock()
+        handler._close_on_handshake_deadline()
+        transport.close.assert_not_called()
+
+
+def test_AbstractServerHandler_handshake_deadline_cancelled(event_loop):
+    """Check that the handshake deadline is cancelled after 'hello' and when the connection is lost."""
+
+    class ServerMock:
+        def __init__(self):
+            self.connection_counts = {"1.2.3.4": 1}
+            self.total_connections = 1
+            self.clients = {}
+            self.configuration = {"node_name": "master"}
+
+    logger = Logger("test_handshake_deadline_cancelled")
+    with patch("logging.getLogger", return_value=logger):
+        handler = AbstractServerHandler(server=ServerMock(), loop=event_loop, fernet_key=fernet_key,
+                                        cluster_items={"test": "server"})
+        handler.loop = Mock()
+        handler.broadcast_reader = Mock()
+        handler.ip = "1.2.3.4"
+        handler._counted_connection = True
+        deadline = Mock()
+        handler._handshake_deadline = deadline
+
+        # A completed handshake disarms the deadline.
+        handler.hello(b"worker1")
+        deadline.cancel.assert_called_once()
+        assert handler._handshake_deadline is None
+
+        # A lost connection disarms the deadline and releases the global slot.
+        handler._handshake_deadline = deadline = Mock()
+        handler.connection_lost(exc=None)
+        deadline.cancel.assert_called_once()
+        assert handler._handshake_deadline is None
+        assert handler.server.total_connections == 0
+        assert "1.2.3.4" not in handler.server.connection_counts
 
 
 @pytest.mark.asyncio
@@ -143,7 +269,21 @@ def test_AbstractServerHandler_hello(event_loop):
     abstract_server_handler.server.clients["if_test"] = "testing"
     with pytest.raises(WazuhClusterError, match=f".* 3028 .* if_test"):
         abstract_server_handler.hello(b"if_test")
-    assert abstract_server_handler.name == ""
+
+    with pytest.raises(WazuhClusterError, match=".* 3060 .*"):
+        abstract_server_handler.hello(b"../../etc")
+
+    with pytest.raises(WazuhClusterError, match=".* 3060 .*"):
+        abstract_server_handler.hello(b"test/node")
+
+    with pytest.raises(WazuhClusterError, match=".* 3060 .*"):
+        abstract_server_handler.hello(b"test\\node")
+
+    with pytest.raises(WazuhClusterError, match=".* 3060 .*"):
+        abstract_server_handler.hello(b".")
+
+    with pytest.raises(WazuhClusterError, match=".* 3060 .*"):
+        abstract_server_handler.hello(b"..")
 
 
 @pytest.mark.asyncio
@@ -197,6 +337,31 @@ async def test_AbstractServerHandler_connection_lost(event_loop):
             mock_debug_logger.assert_called_once_with("Disconnected unit.")
             task_mock.cancel.assert_called_once()
 
+    # Verify that connection_counts is decremented when _counted_connection is True.
+    class ServerMockCounts:
+        def __init__(self):
+            self.clients = {}
+            self.configuration = {"node_name": "elif_test"}
+            self.connection_counts = {"1.2.3.4": 3}
+            self.total_connections = 3
+
+    with patch("logging.getLogger", return_value=logger):
+        counted_handler = AbstractServerHandler(server=ServerMockCounts(), loop=event_loop,
+                                                fernet_key=fernet_key,
+                                                cluster_items={"test": "server"})
+        counted_handler.ip = "1.2.3.4"
+        counted_handler._counted_connection = True
+        counted_handler.connection_lost(exc=None)
+        assert counted_handler.server.connection_counts["1.2.3.4"] == 2
+        assert counted_handler.server.total_connections == 2
+
+        # When count reaches 1, the key is removed entirely.
+        counted_handler.server.connection_counts["1.2.3.4"] = 1
+        counted_handler._counted_connection = True
+        counted_handler.connection_lost(exc=None)
+        assert "1.2.3.4" not in counted_handler.server.connection_counts
+        assert counted_handler.server.total_connections == 1
+
 
 @pytest.mark.asyncio
 @patch("asyncio.Queue")
@@ -246,25 +411,26 @@ def test_AbstractServer_init(AbstractServerHandler_mock, keepalive_mock):
     """Check the correct initialization of the AbstractServer object."""
     with patch("wazuh.core.cluster.server.context_tag", ContextVar("tag", default="")) as mock_contextvar:
         abstract_server = AbstractServer(performance_test=1, concurrency_test=2, configuration={"test3": 3},
-                                         cluster_items={"test4": 4}, enable_ssl=True)
+                                         cluster_items={"test4": 4})
 
         assert abstract_server.clients == {}
         assert abstract_server.performance == 1
         assert abstract_server.concurrency == 2
         assert abstract_server.configuration == {"test3": 3}
         assert abstract_server.cluster_items == {"test4": 4}
-        assert abstract_server.enable_ssl is True
         assert abstract_server.tag == "Abstract Server"
         assert mock_contextvar.get() == "Abstract Server"
         assert isinstance(abstract_server.logger, Logger)
 
         logger = Logger("abs")
         abstract_server = AbstractServer(performance_test=1, concurrency_test=2, configuration={"test3": 3},
-                                         cluster_items={"test4": 4}, enable_ssl=True, logger=logger, tag="test")
+                                         cluster_items={"test4": 4}, logger=logger, tag="test")
         assert abstract_server.tag == "test"
         assert mock_contextvar.get() == "test"
         assert abstract_server.logger == logger
         assert abstract_server.broadcast_results == {}
+        assert abstract_server.connection_counts == {}
+        assert abstract_server.total_connections == 0
 
 
 @patch("asyncio.get_running_loop", new=Mock())
@@ -279,7 +445,7 @@ def test_AbstractServer_broadcast(AbstractServerHandler_mock, asynckeepalive_moc
     worker1_instance = Mock()
     worker2_instance = Mock()
     abstract_server = AbstractServer(performance_test=1, concurrency_test=2, configuration={"test3": 3},
-                                     cluster_items={"test4": 4}, enable_ssl=True, logger=logger_mock)
+                                     cluster_items={"test4": 4}, logger=logger_mock)
     abstract_server.clients = {"worker1": worker1_instance, "worker2": worker2_instance}
 
     abstract_server.broadcast(test_func, "test_param", keyword_param="param")
@@ -294,7 +460,7 @@ def test_AbstractServer_broadcast_ko():
     """Verify that expected error log is printed when an exception is raised."""
     logger_mock = Mock()
     abstract_server = AbstractServer(performance_test=1, concurrency_test=2, configuration={"test3": 3},
-                                     cluster_items={"test4": 4}, enable_ssl=True, logger=logger_mock)
+                                     cluster_items={"test4": 4}, logger=logger_mock)
     abstract_server.clients = {"worker1": "test"}
 
     abstract_server.broadcast("test_f", "test_param", keyword_param="param")
@@ -313,7 +479,7 @@ def test_AbstractServer_broadcast_add(uuid_mock):
     worker1_instance = Mock()
     worker2_instance = Mock()
     abstract_server = AbstractServer(performance_test=1, concurrency_test=2, configuration={"test3": 3},
-                                     cluster_items={"test4": 4}, enable_ssl=True, logger=logger_mock)
+                                     cluster_items={"test4": 4}, logger=logger_mock)
     abstract_server.broadcast_results = {}
     abstract_server.clients = {"worker1": worker1_instance, "worker2": worker2_instance}
 
@@ -329,7 +495,7 @@ def test_AbstractServer_broadcast_add_ko(uuid_mock):
     """Check that expected error log is printed and that broadcast_results is deleted."""
     logger_mock = Mock()
     abstract_server = AbstractServer(performance_test=1, concurrency_test=2, configuration={"test3": 3},
-                                     cluster_items={"test4": 4}, enable_ssl=True, logger=logger_mock)
+                                     cluster_items={"test4": 4}, logger=logger_mock)
     abstract_server.broadcast_results = {}
     abstract_server.clients = {"worker1": "test"}
 
@@ -352,7 +518,7 @@ def test_AbstractServer_broadcast_pop(broadcast_results, expected_response):
     """Check that expected response is returned for each case."""
     logger_mock = Mock()
     abstract_server = AbstractServer(performance_test=1, concurrency_test=2, configuration={"test3": 3},
-                                     cluster_items={"test4": 4}, enable_ssl=True, logger=logger_mock)
+                                     cluster_items={"test4": 4}, logger=logger_mock)
     abstract_server.broadcast_results = broadcast_results
     abstract_server.clients = {"worker1": "test", "worker2": "test"}
 
@@ -366,7 +532,7 @@ def test_AbstractServer_to_dict():
                      "nodes": [0, 1],
                      "node_name": "worker2"}
     abstract_server = AbstractServer(performance_test=1, concurrency_test=2, configuration=configuration,
-                                     cluster_items={"test4": 4}, enable_ssl=True)
+                                     cluster_items={"test4": 4})
     assert abstract_server.to_dict() == {"info": {"ip": configuration["nodes"][0], "name": configuration['node_name']}}
 
 
@@ -375,7 +541,7 @@ def test_AbstractServer_setup_task_logger():
     """Check that a logger is created with a specific tag."""
     logger = Logger("setup_task_logger")
     abstract_server = AbstractServer(performance_test=1, concurrency_test=2, configuration={"test3": 3},
-                                     cluster_items={"test4": 4}, enable_ssl=True, logger=logger)
+                                     cluster_items={"test4": 4}, logger=logger)
     assert abstract_server.setup_task_logger(task_tag="zxf").name == "setup_task_logger.zxf"
 
     with patch.object(abstract_server.logger, "getChild") as mock_child:
@@ -389,7 +555,7 @@ def test_AbstractServer_get_connected_nodes(mock_process_array):
     """Check that all the necessary data is sent to the utils.process_array
     function to return all the information of the connected nodes."""
     abstract_server = AbstractServer(performance_test=1, concurrency_test=2, configuration={"test3": 3},
-                                     cluster_items={"test4": 4}, enable_ssl=True)
+                                     cluster_items={"test4": 4})
     basic_dict = {"info": {"first": "test"}}
 
     with patch.object(abstract_server, "to_dict", return_value=basic_dict):
@@ -407,7 +573,7 @@ def test_AbstractServer_get_connected_nodes(mock_process_array):
 def test_AbstractServer_get_connected_nodes_ko(mock_process_array):
     """Check all exceptions that can be returned by the get_connected_nodes function."""
     abstract_server = AbstractServer(performance_test=1, concurrency_test=2, configuration={"test3": 3},
-                                     cluster_items={"test4": 4}, enable_ssl=True)
+                                     cluster_items={"test4": 4})
     basic_dict = {"info": {"first": "test"}}
 
     with patch.object(abstract_server, "to_dict", return_value=basic_dict):
@@ -451,7 +617,7 @@ async def test_AbstractServer_check_clients_keepalive(sleep_mock):
             with patch("wazuh.core.cluster.server.AbstractServer.setup_task_logger",
                        return_value=logger):
                 abstract_server = AbstractServer(performance_test=1, concurrency_test=2, configuration={"test3": 3},
-                                                 cluster_items={"test4": 4}, enable_ssl=True, logger=logger)
+                                                 cluster_items={"test4": 4}, logger=logger)
                 tester = "check_clients_keepalive"
                 abstract_server.cluster_items = {"intervals": {"master": {"check_worker_lastkeepalive": tester}}}
                 try:
@@ -487,7 +653,7 @@ async def test_AbstractServer_performance_test(perf_counter_mock, sleep_mock):
     logger = Logger("test_echo")
     with patch.object(logger, "info") as mock_info:
         abstract_server = AbstractServer(performance_test=1, concurrency_test=2, configuration={"test3": 3},
-                                         cluster_items={"test4": 4}, enable_ssl=True, logger=logger)
+                                         cluster_items={"test4": 4}, logger=logger)
         abstract_server.clients = {b"worker_test": ClientMock()}
         abstract_server.performance = 2
         try:
@@ -513,7 +679,7 @@ async def test_AbstractServer_concurrency_test(perf_counter_mock, sleep_mock):
     logger = Logger("test_echo")
     with patch.object(logger, "info") as mock_info:
         abstract_server = AbstractServer(performance_test=1, concurrency_test=2, configuration={"test3": 3},
-                                         cluster_items={"test4": 4}, enable_ssl=True, logger=logger)
+                                         cluster_items={"test4": 4}, logger=logger)
         abstract_server.clients = {b"worker_test": ClientMock()}
         abstract_server.concurrency = 777
         try:
@@ -553,7 +719,7 @@ async def test_AbstractServer_start(keepalive_mock, mock_path_join):
     cluster_items = {"intervals": {"master": {"check_worker_lastkeepalive": 987}}}
     abstract_server = AbstractServer(performance_test=1, concurrency_test=2,
                                         configuration={"bind_addr": "localhost", "port": 10000},
-                                        cluster_items=cluster_items, enable_ssl=False, logger=logger)
+                                        cluster_items=cluster_items, logger=logger)
     with patch("wazuh.core.cluster.server.context_tag", ContextVar("tag", default="")) as mock_contextvar:
         with patch.object(abstract_server, "handler_class"):
             abstract_server.loop = loop
@@ -564,20 +730,6 @@ async def test_AbstractServer_start(keepalive_mock, mock_path_join):
             loop.set_exception_handler.assert_called_once_with(c_common.asyncio_exception_handler)
             loop.create_server.assert_awaited_once()
 
-    abstract_server = AbstractServer(performance_test=1, concurrency_test=2,
-                            configuration={"bind_addr": 3, "port": 10000},
-                            cluster_items=cluster_items, enable_ssl=True,
-                            logger=logger)
-    with patch("wazuh.core.cluster.server.context_tag", ContextVar("tag", default="")) as mock_contextvar:
-        with patch.object(abstract_server, "handler_class"):
-            ssl_mock = SSLMock()
-            with patch("ssl.create_default_context", return_value=ssl_mock) as create_default_context_mock:
-                with patch.object(ssl_mock, "load_cert_chain") as load_cert_chain_mock:
-                    abstract_server.loop = loop
-                    await abstract_server.start()
-                    create_default_context_mock.assert_called_once_with(purpose=ssl.Purpose.CLIENT_AUTH)
-                    load_cert_chain_mock.assert_called_once_with(certfile="testing_path",
-                                                                            keyfile="testing_path")
 
 
 @pytest.mark.asyncio
@@ -593,7 +745,7 @@ async def test_AbstractServer_start_ko(keepalive_mock, set_event_loop_policy_moc
         def set_exception_handler(self, handler):
             pass
 
-        async def create_server(self, protocol_factory, host, port, ssl):
+        async def create_server(self, protocol_factory, host, port):
             raise OSError("test_start")
 
     logger = Logger("start")
@@ -608,7 +760,7 @@ async def test_AbstractServer_start_ko(keepalive_mock, set_event_loop_policy_moc
                                                                              {"check_worker_lastkeepalive": 987}
                                                                          }
                                                                     },
-                                                     enable_ssl=False, logger=logger)
+                                                     logger=logger)
                     abstract_server.configuration["key"] = fernet_key
                     await abstract_server.start()
                     mock_logger.assert_called_once_with("Could not start master: ")

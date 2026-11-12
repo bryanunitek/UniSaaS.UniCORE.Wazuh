@@ -7,6 +7,7 @@
  * Foundation.
  */
 
+#include "windowsHelper.h"
 #include "ie_explorer.hpp"
 #include <iostream>
 #include <string>
@@ -161,9 +162,9 @@ std::string IEExtensionsProvider::HKeyToString(HKEY hKey)
 }
 
 
-void IEExtensionsProvider::getRegistryPathsFromKeys(HKEY hive, const std::vector<std::string> clsidKeys, std::vector<std::string>& regPaths)
+void IEExtensionsProvider::getRegistryPathsFromKeys(HKEY hive, const std::vector<std::string>& clsidKeys, std::vector<std::string>& regPaths)
 {
-    for (auto& subKey : clsidKeys)
+    for (const auto& subKey : clsidKeys)
     {
         HKEY hKey = getHKeyFromKeyString(hive, subKey);
 
@@ -222,11 +223,13 @@ std::vector<std::string> IEExtensionsProvider::listSubKeys(HKEY hive)
     return subKeys;
 }
 
-std::vector<std::string> IEExtensionsProvider::expandUserKey(const std::string key)
+std::vector<std::string> IEExtensionsProvider::expandUserKey(const std::string& key)
 {
     std::vector<std::string> expandedKeys;
+    const auto subKeys = listSubKeys(HKEY_USERS);
+    expandedKeys.reserve(subKeys.size());
 
-    for (const auto& prefix : listSubKeys(HKEY_USERS))
+    for (const auto& prefix : subKeys)
     {
         expandedKeys.emplace_back(prefix + SEPARATOR + key);
     }
@@ -307,6 +310,11 @@ std::vector<std::string> IEExtensionsProvider::getExecutables(const std::string&
 
 std::string IEExtensionsProvider::GetFileVersion(const std::string& filePath)
 {
+    if (filePath.find_first_of("\\/") != std::string::npos && !Utils::isLocalFixedPath(filePath))
+    {
+        return "No version info";
+    }
+
     // Convert std::string (UTF-8/ANSI) to std::wstring (UTF-16)
     std::wstring wFilePath(filePath.begin(), filePath.end());
 

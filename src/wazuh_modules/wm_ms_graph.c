@@ -223,6 +223,7 @@ static curl_response* wm_ms_graph_http_get_with_retry(char** headers, const char
             if (retry_after > WM_MS_GRAPH_MAX_RETRY_AFTER_WARN) {
                 mtwarn(WM_MS_GRAPH_LOGTAG, "Retry-After value (%ds) for relationship '%s' exceeds (%ds).",
                     retry_after, relationship_name, WM_MS_GRAPH_MAX_RETRY_AFTER_WARN);
+                retry_after = WM_MS_GRAPH_MAX_RETRY_AFTER_WARN;
             }
             mtdebug1(WM_MS_GRAPH_LOGTAG, "Received HTTP 429 for relationship '%s'. Retrying after %ds (attempt %d/%d).",
                 relationship_name, retry_after, attempt + 1, WM_MS_GRAPH_MAX_RETRIES);
@@ -290,6 +291,13 @@ void wm_ms_graph_scan_relationships(wm_ms_graph* ms_graph, wm_ms_graph_auth* aut
             if (!inventory) {
                 snprintf(relationship_state_name, OS_SIZE_1024 -1, "%s-%s-%s-%s", WM_MS_GRAPH_CONTEXT.name,
                     auth_config->tenant_id, ms_graph->resources[resource_num].name, ms_graph->resources[resource_num].relationships[relationship_num]);
+                // Replace '/' with '-' so relationship names like "cases/eDiscoveryCases"
+                // don't create invalid subdirectory paths in the state file location.
+                for (char *p = relationship_state_name; *p; p++) {
+                    if (*p == '/') {
+                        *p = '-';
+                    }
+                }
 
                 memset(&relationship_state_struc, 0, sizeof(relationship_state_struc));
 
@@ -304,7 +312,9 @@ void wm_ms_graph_scan_relationships(wm_ms_graph* ms_graph, wm_ms_graph_auth* aut
                     (!initial_scan && !relationship_state_struc.next_time)) {
                     relationship_state_struc.next_time = scan_time;
                     if (wm_state_io(relationship_state_name, WM_IO_WRITE, &relationship_state_struc, sizeof(relationship_state_struc)) < 0) {
-                        mterror(WM_MS_GRAPH_LOGTAG, "Couldn't save running state.");
+                        mterror(WM_MS_GRAPH_LOGTAG, "Couldn't save running state for resource '%s' and relationship '%s'. State file: '" WM_STATE_DIR "/%s'.",
+                            ms_graph->resources[resource_num].name, ms_graph->resources[resource_num].relationships[relationship_num],
+                            relationship_state_name);
                     } else if (isDebug()) {
                         gmtime_r(&scan_time, &tm_aux);
                         strftime(start_time_str, sizeof(start_time_str), "%Y-%m-%dT%H:%M:%SZ", &tm_aux);
@@ -426,9 +436,14 @@ void wm_ms_graph_scan_relationships(wm_ms_graph* ms_graph, wm_ms_graph_auth* aut
 
                             cJSON* next_url = cJSON_GetObjectItem(body_parse, "@odata.nextLink");
                             if (cJSON_IsString(next_url)) {
-                                memset(url, '\0', OS_SIZE_8192);
-                                snprintf(url, OS_SIZE_8192 -1, "%s", next_url->valuestring);
-                                next_page = true;
+                                if (wm_url_is_allowed(next_url->valuestring, auth_config->query_fqdn)) {
+                                    memset(url, '\0', OS_SIZE_8192);
+                                    snprintf(url, OS_SIZE_8192 -1, "%s", next_url->valuestring);
+                                    next_page = true;
+                                } else {
+                                    mtwarn(WM_MS_GRAPH_LOGTAG, "Ignoring next page URL out of '%s'.", auth_config->query_fqdn);
+                                    fail = true;
+                                }
                             }
 
                             cJSON_Delete(body_parse);
@@ -448,7 +463,9 @@ void wm_ms_graph_scan_relationships(wm_ms_graph* ms_graph, wm_ms_graph_auth* aut
             if (!inventory && !fail) {
                 relationship_state_struc.next_time = scan_time;
                 if (wm_state_io(relationship_state_name, WM_IO_WRITE, &relationship_state_struc, sizeof(relationship_state_struc)) < 0) {
-                    mterror(WM_MS_GRAPH_LOGTAG, "Couldn't save running state.");
+                    mterror(WM_MS_GRAPH_LOGTAG, "Couldn't save running state for resource '%s' and relationship '%s'. State file: '" WM_STATE_DIR "/%s'.",
+                        ms_graph->resources[resource_num].name, ms_graph->resources[resource_num].relationships[relationship_num],
+                        relationship_state_name);
                 } else {
                     mtdebug1(WM_MS_GRAPH_LOGTAG, "Bookmark updated to '%s' for tenant '%s' resource '%s' and relationship '%s', waiting '%d' seconds to run next scan.",
                         end_time_str, auth_config->tenant_id, ms_graph->resources[resource_num].name, ms_graph->resources[resource_num].relationships[relationship_num], ms_graph->scan_config.interval);
@@ -520,9 +537,13 @@ cJSON* wm_ms_graph_scan_apps_devices(const wm_ms_graph* ms_graph, const cJSON* a
 
                         cJSON* next_url = cJSON_GetObjectItem(body_parse, "@odata.nextLink");
                         if (cJSON_IsString(next_url)) {
-                            memset(url, '\0', OS_SIZE_8192);
-                            snprintf(url, OS_SIZE_8192 -1, "%s", next_url->valuestring);
-                            next_page = true;
+                            if (wm_url_is_allowed(next_url->valuestring, query_fqdn)) {
+                                memset(url, '\0', OS_SIZE_8192);
+                                snprintf(url, OS_SIZE_8192 -1, "%s", next_url->valuestring);
+                                next_page = true;
+                            } else {
+                                mtwarn(WM_MS_GRAPH_LOGTAG, "Ignoring next page URL out of '%s'.", query_fqdn);
+                            }
                         }
 
                         cJSON_Delete(body_parse);

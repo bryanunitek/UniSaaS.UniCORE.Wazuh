@@ -621,7 +621,7 @@ checks:
       - soc_2: ["CC7.1", "CC8.1"]
     condition: all
     rules:
-      - "c:security authorizationdb read system.preferences | grep -A1 shared -> r:>false<"
+      - 'c:sh -c "security authorizationdb read system.preferences | grep -A1 shared" -> r:>false<'
 
   # 2.7.1 Ensure Screen Saver Corners Are Secure. (Automated) - Not Implemented
   # 2.8.1 Audit Universal Control Settings. (Manual) - Not Implemented
@@ -1364,7 +1364,7 @@ checks:
     condition: all
     rules:
       - "d:/Library/Security -> r:^PolicyBanner"
-      - 'c:stat -f %A /Library/Security/PolicyBanner.* -> r:\d\d4'
+      - 'c:sh -c "stat -f %A /Library/Security/PolicyBanner.*" -> r:\d\d4'
 
   # 5.9 Ensure the Guest Home Folder Does Not Exist. (Automated)
   - id: 34059

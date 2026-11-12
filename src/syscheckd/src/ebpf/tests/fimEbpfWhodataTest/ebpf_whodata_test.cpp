@@ -5,7 +5,6 @@
 #include "bpf_helpers.h"
 
 extern volatile bool event_received;
-extern volatile bool ebpf_hc_created;
 time_t fake_time_now = 0;
 extern time_t (*w_time)(time_t*);
 
@@ -13,6 +12,9 @@ class EbpfWhodataTest : public ::testing::Test {
 protected:
 
     virtual void SetUp() {
+        event_received = false;
+        fake_time_now = 0;
+        w_time = time;
         MockFimebpf::mock_loggingFunction = mock_loggingFunction;
         MockFimebpf::mock_abspath = mock_abspath;
         MockFimebpf::SetMockFunctions();
@@ -22,12 +24,14 @@ protected:
         bpf_helpers->ring_buffer_poll = (ring_buffer__poll_t)mock_ring_buffer_poll_success;
         bpf_helpers->ring_buffer_free = (ring_buffer__free_t)mock_ring_buffer_free;
         bpf_helpers->bpf_object_close = (bpf_object__close_t)mock_bpf_object_close;
-        bpf_helpers->check_invalid_kernel_version = (check_invalid_kernel_version_t)mock_check_invalid_kernel_version;
         bpf_helpers->init_libbpf = (init_libbpf_t)mock_init_libbpf;
         bpf_helpers->init_bpfobj = (init_bpfobj_t)mock_init_bpfobj;
     }
 
     virtual void TearDown() {
+        std::remove("/tmp/ebpf_hc");
+        event_received = false;
+        w_time = time;
         bpf_helpers.reset();
     }
 };
@@ -78,7 +82,7 @@ TEST_F(EbpfWhodataTest, RingBufferPollError) {
 
 TEST_F(EbpfWhodataTest, EbpfWhodataHealthcheckTestSuccess) {
 
-    event_received = true;
+    bpf_helpers->ring_buffer_poll = (ring_buffer__poll_t)mock_ring_buffer_poll_healthcheck_success;
 
     EXPECT_FALSE(ebpf_whodata_healthcheck());
 }
@@ -88,6 +92,7 @@ TEST_F(EbpfWhodataTest, EbpfWhodataHealthcheckTestFailInitRingBuffer) {
     bpf_helpers->init_ring_buffer = (init_ring_buffer_t)mock_init_ring_buffer_failure;
 
     EXPECT_TRUE(ebpf_whodata_healthcheck());
+    EXPECT_EQ(bpf_helpers->init_bpfobj, nullptr);
 }
 
 TEST_F(EbpfWhodataTest, EbpfWhodataHealthcheckTestFailNoEventReceived) {
@@ -98,8 +103,13 @@ TEST_F(EbpfWhodataTest, EbpfWhodataHealthcheckTestFailNoEventReceived) {
         fake_time_now += 5;
         return 0;
     };
+    static int close_calls;
+    close_calls = 0;
+    bpf_helpers->bpf_object_close = [](bpf_object*) { close_calls++; };
 
     EXPECT_TRUE(ebpf_whodata_healthcheck());
+    EXPECT_EQ(close_calls, 1);
+    EXPECT_EQ(bpf_helpers->init_bpfobj, nullptr);
 }
 
 void SetUpModule() {}

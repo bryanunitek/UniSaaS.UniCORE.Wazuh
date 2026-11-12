@@ -26,8 +26,10 @@
 ///< JSON path wich contains the files position of last read
 #ifdef WIN32
 #define LOCALFILE_STATUS   "queue\\logcollector\\file_status.json"
+#define LOCALFILE_STATUS_TMP   "queue\\logcollector\\file_status.json.tmp"
 #else
 #define LOCALFILE_STATUS        "queue/logcollector/file_status.json"
+#define LOCALFILE_STATUS_TMP    "queue/logcollector/file_status.json.tmp"
 #endif
 
 ///< JSON fields for file_status
@@ -326,6 +328,19 @@ int w_update_file_status(const char * path, int64_t pos, EVP_MD_CTX *context);
  */
 bool w_get_hash_context(logreader *lf, EVP_MD_CTX **context, int64_t position);
 
+/**
+ * @brief Update the hash context with the line just read by fgets, NUL bytes included
+ *
+ * fgets does not report how many bytes it read, so the length is the distance between `*position`
+ * and the current position of the stream. If the position cannot be read, the line is hashed up to
+ * its first NUL, as before (w_ftell already logs the failure).
+ * @param lf Structure that contains file information.
+ * @param context EVP_MD_CTX context.
+ * @param line Line read from `lf->fp`.
+ * @param position Position of the stream before the line was read. It is moved to the end of the line.
+ */
+void w_hash_read_line(logreader *lf, EVP_MD_CTX *context, const char *line, int64_t *position);
+
 extern int sample_log_length;
 extern int lc_debug_level;
 extern int accept_remote;
@@ -336,6 +351,8 @@ extern rlim_t nofile;
 #endif
 
 #if defined(Darwin) || (defined(__linux__) && defined(WAZUH_UNIT_TESTING))
+extern volatile sig_atomic_t macos_log_shutdown;
+
 /**
  * @brief This function is called to release macOS log's "show" and/or "stream" resources
  */
@@ -350,6 +367,14 @@ void w_macos_release_log_show(void);
  * @brief This function is called to release macOS log's "stream" resources
  */
 void w_macos_release_log_stream(void);
+
+/**
+ * @brief Reads the macOS `log` output every MACOS_LOG_READ_INTERVAL_MS until its process stops
+ *
+ * @param arg Unused
+ * @return NULL
+ */
+void * w_macos_log_reader(void * arg);
 #endif
 
 #endif /* LOGREADER_H */

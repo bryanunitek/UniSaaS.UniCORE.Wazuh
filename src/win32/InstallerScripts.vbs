@@ -346,12 +346,30 @@ public function config()
 End Function
 
 Private Function GetVersion()
-	Set objWMIService = GetObject("winmgmts:\\.\root\cimv2")
-	Set colItems = objWMIService.ExecQuery("Select * from Win32_OperatingSystem",,48)
+	Dim WshShell, majorVersion, currentVersion
+	Set WshShell = CreateObject("WScript.Shell")
 
-	For Each objItem in colItems
-		GetVersion = Split(objItem.Version,".")(0)
-	Next
+	On Error Resume Next
+
+	' Windows 10/11 and Server 2016+ expose the major version as a DWORD.
+	majorVersion = WshShell.RegRead("HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\CurrentMajorVersionNumber")
+	If Err.Number = 0 And IsNumeric(majorVersion) Then
+		GetVersion = CStr(majorVersion)
+	Else
+		' Older systems: parse the "CurrentVersion" string value (e.g. "6.1", "6.3").
+		Err.Clear
+		currentVersion = WshShell.RegRead("HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\CurrentVersion")
+		If Err.Number = 0 And Len(currentVersion) > 0 Then
+			GetVersion = Split(currentVersion, ".")(0)
+		Else
+			' Last resort: don't abort the install if the version can't be read, and don't
+			' silently skip SetWazuhPermissions()'s ACL hardening either - every currently
+			' supported Windows version satisfies ">= 6", so assume one instead of "0".
+			GetVersion = "6"
+		End If
+	End If
+
+	On Error GoTo 0
 End Function
 
 Public Function CheckSvcRunning()
@@ -378,6 +396,39 @@ Private Function IsStateRunning(scOutput)
         If InStr(line, "STATE") > 0 And InStr(line, ": 4 ") > 0 Then
             IsStateRunning = True
             Exit For
+        End If
+    Next
+End Function
+
+' Sets WAZUH_PENDING_CONFLICT to the first pending restart file operation that touches the install folder.
+Public Function CheckPendingConflict()
+    On Error Resume Next
+    CheckPendingConflict = 0
+    installDir = Session.Property("APPLICATIONFOLDER")
+    If installDir = "" Then installDir = Session.Property("ProgramFilesFolder") & Session.Property("ApplicationFolderName")
+    If Right(installDir, 1) <> "\" Then installDir = installDir & "\"
+    shortDir = installDir
+    Set objFSO = CreateObject("Scripting.FileSystemObject")
+    If objFSO.FolderExists(installDir) Then shortDir = objFSO.GetFolder(installDir).ShortPath & "\"
+
+    ' WScript.Shell.RegRead stops at the first empty string of a REG_MULTI_SZ, so read it through WMI.
+    Err.Clear
+    Set objReg = GetObject("winmgmts:{impersonationLevel=impersonate}!\\.\root\default:StdRegProv")
+    If Err.Number <> 0 Then
+        If Session.Property("MsiSystemRebootPending") = "1" Then Session.Property("WAZUH_PENDING_CONFLICT") = "PendingFileRenameOperations"
+        Exit Function
+    End If
+
+    For Each valueName In Array("PendingFileRenameOperations", "PendingFileRenameOperations2")
+        entries = Empty
+        objReg.GetMultiStringValue &H80000002, "SYSTEM\CurrentControlSet\Control\Session Manager", valueName, entries
+        If IsArray(entries) Then
+            hits = Filter(entries, installDir, True, vbTextCompare)
+            If UBound(hits) < 0 Then hits = Filter(entries, shortDir, True, vbTextCompare)
+            If UBound(hits) >= 0 Then
+                Session.Property("WAZUH_PENDING_CONFLICT") = hits(0)
+                Exit Function
+            End If
         End If
     Next
 End Function
@@ -443,6 +494,14 @@ Public Function SetWazuhPermissions()
         ' inherited permissions on client.keys and ossec.conf when using win32ui.
         remAuthenticatedUsersPermsTmpDir = "icacls """ & home_dir & "tmp" & """ /remove:g *S-1-5-11 /q"
         WshShell.run remAuthenticatedUsersPermsTmpDir, 0, True
+
+        ' Remove the Authenticated Users group from the shared directory and everything below it,
+        ' so the group configuration received from the manager (agent.conf, merged.mg, ...) gets
+        ' the same permissions as ossec.conf. Files the agent writes there later inherit only the
+        ' Administrators and SYSTEM entries, and a file replaced in place keeps the DACL of the
+        ' file it replaces.
+        remAuthenticatedUsersPermsSharedDir = "icacls """ & home_dir & "shared" & """ /remove:g *S-1-5-11 /t /c /q"
+        WshShell.run remAuthenticatedUsersPermsSharedDir, 0, True
 
     End If
 End Function

@@ -10,7 +10,8 @@
 #include "shared.h"
 
 #ifndef WIN32
-#define LOG_FILE "logs/active-responses.log"
+#define AR_LOG_DIR "logs"
+#define AR_LOG_FILE_NAME "active-responses.log"
 #else
 #define LOG_FILE "active-response\\active-responses.log"
 #endif
@@ -77,18 +78,30 @@ const char* get_command_from_json(const cJSON *input);
 const cJSON* get_alert_from_json(const cJSON *input);
 
 /**
- * Get srcip from input
+ * Get srcip from input and validate that it is a valid IP address
  * @param input Input
- * @return char * with the srcip or NULL on fail
+ * @return char * with the srcip or NULL on fail or invalid IP
  * */
 const char* get_srcip_from_json(const cJSON *input);
 
 /**
- * Get username from input
+ * Get username from input and validate that it is a valid username format
  * @param input Input
- * @return char * with the username or NULL on fail
+ * @return char * with the username or NULL on fail or invalid username
  * */
 const char* get_username_from_json(const cJSON *input);
+
+/**
+ * Validate username format
+ * Accepts only [A-Za-z0-9._-] plus '$' anywhere for machine accounts, and rejects
+ * a leading dash so the name cannot be read as an option. '@' is excluded: only
+ * local accounts can be locked, and those cannot carry a realm suffix.
+ * Rejects: reserved names (root), empty strings, null, names over 256 bytes
+ * @param username Username to validate
+ * @retval 1 If username is valid
+ * @retval 0 If username is invalid
+ * */
+int is_valid_username(const char *username);
 
 /**
  * Get extra_args from input
@@ -127,7 +140,38 @@ void splitStrFromCharDelimiter(const char * output_buf, const char delimiter, ch
 */
 int isEnabledFromPattern(const char * output_buf, const char * str_pattern_1, const char * str_pattern_2);
 
+/**
+ * Check ip version from a string
+ * Uses getaddrinfo() with AI_NUMERICHOST to validate IP format
+ * @param ip Ip to check version
+ * @retval 4 If ip is ipv4
+ * @retval 6 If ip is ipv6
+ * @retval OS_INVALID on Invalid IP or error
+ * */
+int get_ip_version(const char *ip);
+
 #ifndef WIN32
+
+/**
+ * Canonicalize a numeric IP into its standard text form (e.g. "2001:0db8::1" -> "2001:db8::1")
+ * using strict inet_pton parsing; non-canonical IPv4 forms (octal, hex, short) are rejected
+ * @param ip Numeric IP to canonicalize
+ * @param output Buffer that receives the canonical form
+ * @param output_size Size of output
+ * @retval true on success
+ * @retval false on error or non-canonical/invalid IP
+ * */
+bool canonicalize_ip(const char *ip, char *output, size_t output_size);
+
+/**
+ * Check whether a hosts.deny file line is exactly the Wazuh-managed rule
+ * (trailing EOL/whitespace ignored), so substrings never match
+ * @param line Line read from hosts.deny
+ * @param rule Exact rule Wazuh writes (e.g. "ALL:10.0.0.1")
+ * @retval true if the line is that rule
+ * @retval false otherwise
+ * */
+bool hosts_deny_rule_matches(const char *line, const char *rule);
 
 /**
  * Write process pid to lock simultaneous executions of the script
@@ -145,14 +189,5 @@ int lock(const char *lock_path, const char *lock_pid_path, const char *log_path,
  * @param log_path Messages log file
  * */
 void unlock(const char *lock_path, const char *log_path);
-
-/**
- * Check ip version from a string
- * @param ip Ip to check version
- * @retval 4 If ip is ipv4
- * @retval 6 If ip is ipv6
- * @retval OS_INVALID on Invalid IP or error
- * */
-int get_ip_version(const char *ip);
 
 #endif

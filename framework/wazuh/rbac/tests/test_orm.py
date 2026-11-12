@@ -189,6 +189,24 @@ def test_add_rule(db_setup):
         assert rum.get_rule_by_name('not_exists') == db_setup.SecurityError.RULE_NOT_EXIST
 
 
+@pytest.mark.parametrize('rule', [
+    {'MATCH': {'user': ["r'^a|b"]}},
+    {'MATCH': {"r'^user": ['admin']}},
+    {'FIND': {'user': "r'"}},
+    {'MATCH': {'user': ["r'^(a'"]}},
+])
+def test_add_and_update_rule_reject_malformed_regex(db_setup, rule):
+    """Rules holding an unclosed or non-compiling r'...' expression must not be stored."""
+    with db_setup.RulesManager() as rum:
+        assert rum.add_rule(name='malformed_rule', rule=rule) == db_setup.SecurityError.INVALID
+        assert rum.get_rule_by_name('malformed_rule') == db_setup.SecurityError.RULE_NOT_EXIST
+
+        assert rum.add_rule(name='valid_rule', rule={'MATCH': {'user': ["r'^a|b'"]}}) is True
+        rule_id = rum.get_rule_by_name('valid_rule')['id']
+        assert rum.update_rule(rule_id=rule_id, name='valid_rule', rule=rule) == db_setup.SecurityError.INVALID
+        assert rum.get_rule(rule_id)['rule'] == {'MATCH': {'user': ["r'^a|b'"]}}
+
+
 def test_get_user(db_setup):
     """Check users in the database"""
     with db_setup.AuthenticationManager() as am:
@@ -982,7 +1000,7 @@ def test_databasemanager_get_table(fresh_in_memory_db):
     current_columns = set(re.findall(column_regex, str(fresh_in_memory_db.db_manager.get_table(
         session, fresh_in_memory_db.User))))
     with patch("wazuh.rbac.orm._new_columns", new={"new_column"}):
-        updated_columns = set(re.findall(column_regex, str(fresh_in_memory_db.db_manager.get_table(session, 
+        updated_columns = set(re.findall(column_regex, str(fresh_in_memory_db.db_manager.get_table(session,
                                                                                                    EnhancedUser))))
 
     assert current_columns == updated_columns
@@ -1084,7 +1102,7 @@ def test_check_database_integrity_exceptions(remove_mock, close_sessions_mock, e
 ])
 def test_migrate_data(db_setup, from_id, to_id, users):
     """Test `migrate_data` function briefly.
-    
+
     NOTE: To correctly test this procedure, use the RBAC database migration integration tests."""
     # This test case updates the default user passwords and omits the rest of the migration
     if to_id == WAZUH_WUI_USER_ID:

@@ -16,13 +16,18 @@
 #include "reflectiveJson.hpp"
 #include "secureCommunication.hpp"
 #include "serverSelector.hpp"
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <grp.h>
+#include <map>
 #include <mutex>
 #include <pwd.h>
+#include <set>
 #include <unistd.h>
+#include <vector>
 
 constexpr auto USER_GROUP {"wazuh"};
 constexpr auto DEFAULT_PATH {"tmp/root-ca-merged.pem"};
@@ -34,6 +39,7 @@ constexpr auto ELEMENTS_PER_BULK {25000};
 constexpr auto MINIMAL_ELEMENTS_PER_BULK {5};
 
 constexpr auto HTTP_BAD_REQUEST {400};
+constexpr auto HTTP_NOT_FOUND {404};
 constexpr auto HTTP_CONTENT_LENGTH {413};
 constexpr auto HTTP_VERSION_CONFLICT {409};
 constexpr auto HTTP_TOO_MANY_REQUESTS {429};
@@ -274,6 +280,189 @@ static inline void extractErrorInfo(const std::string& errorBody, std::string& t
     }
 }
 
+/**
+ * @brief Replace every control character in place with a space.
+ *
+ * @param value Text to sanitize.
+ */
+static inline void sanitizeLogText(std::string& value) noexcept
+{
+    std::replace_if(
+        value.begin(), value.end(), [](unsigned char character) { return std::iscntrl(character) != 0; }, ' ');
+}
+
+/**
+ * @brief Log the per-item rejections inside a `_bulk` response body that still returned HTTP 200 overall.
+ *        OpenSearch reports these inside `errors`/`items[]` rather than as a transport-level error, so
+ * `extractErrorInfo` (which only understands the top-level `{"error": {...}}` shape) doesn't see them.
+ *        Rejections are aggregated by error type and reason and reported as one entry per distinct pair,
+ * since a single bulk can carry up to ELEMENTS_PER_BULK of them.
+ *
+ * @param responseJson Parsed response body.
+ * @param indexName Name of the index the bulk was sent to.
+ */
+static inline void logBulkItemErrors(const nlohmann::json& responseJson, const std::string& indexName)
+{
+    if (!responseJson.value("errors", false) || !responseJson.contains("items"))
+    {
+        return;
+    }
+
+    // Keyed by (type, reason), holding the number of items rejected with it and the first id seen for it.
+    std::map<std::pair<std::string, std::string>, std::pair<std::size_t, std::string>> rejections;
+
+    for (const auto& item : responseJson.at("items"))
+    {
+        for (const auto& entry : item.items())
+        {
+            const auto& itemData = entry.value();
+            if (itemData.contains("error"))
+            {
+                // Scoped per item: a field that is not the string it is expected to be (an `_id` that
+                // arrives as null, for instance) must not abort the remaining rejections, nor bubble up
+                // and make the caller report a parse failure that never happened.
+                try
+                {
+                    std::string id, type, reason;
+                    if (itemData.contains("_id"))
+                    {
+                        id = itemData.at("_id").get_ref<const std::string&>();
+                    }
+
+                    const auto& error = itemData.at("error");
+                    if (error.contains("type"))
+                    {
+                        type = error.at("type").get_ref<const std::string&>();
+                    }
+                    if (error.contains("reason"))
+                    {
+                        reason = error.at("reason").get_ref<const std::string&>();
+                    }
+
+                    // The document id is partly agent-controlled and the reason echoes the indexer's own error
+                    // text, so strip control characters to keep either from forging log lines.
+                    sanitizeLogText(id);
+                    sanitizeLogText(type);
+                    sanitizeLogText(reason);
+
+                    auto& rejection = rejections[std::make_pair(type, reason)];
+                    if (rejection.first++ == 0)
+                    {
+                        rejection.second = std::move(id);
+                    }
+                }
+                catch (const nlohmann::json::exception&)
+                {
+                    logWarn(IC_NAME, "Unparseable rejection entry in the '%s' bulk response.", indexName.c_str());
+                }
+            }
+        }
+    }
+
+    for (const auto& [error, rejection] : rejections)
+    {
+        logWarn(IC_NAME,
+                "%zu document(s) rejected by index '%s' - type: '%s', reason: '%s', sample id: '%s'",
+                rejection.first,
+                indexName.c_str(),
+                error.first.c_str(),
+                error.second.c_str(),
+                rejection.second.c_str());
+    }
+}
+
+/**
+ * @brief Log the failures reported inside a `_delete_by_query` response body that returned HTTP 200 overall.
+ *        That shape carries no `errors` flag, so a partially failed delete is otherwise indistinguishable
+ * from a fully successful one.
+ *
+ * @param responseJson Parsed response body.
+ * @param indexName Name of the index the query was sent to.
+ */
+static inline void logDeleteByQueryIssues(const nlohmann::json& responseJson, const std::string& indexName)
+{
+    if (!responseJson.contains("failures"))
+    {
+        // Not a delete by query response.
+        return;
+    }
+
+    const auto versionConflicts = responseJson.value("version_conflicts", 0);
+    const auto& failures = responseJson.at("failures");
+
+    if (versionConflicts == 0 && failures.empty())
+    {
+        return;
+    }
+
+    std::string sampleId, sampleReason;
+    if (!failures.empty())
+    {
+        const auto& failure = failures.at(0);
+        sampleId = failure.value("id", "");
+        if (failure.contains("cause"))
+        {
+            // Document-level failure.
+            sampleReason = failure.at("cause").value("reason", "");
+        }
+        else if (failure.contains("reason") && failure.at("reason").is_object())
+        {
+            // Search-phase failure: no document id, the cause sits under "reason" instead.
+            sampleReason = failure.at("reason").value("reason", "");
+        }
+
+        // Same exposure as the bulk path: the id is partly agent-controlled and the reason echoes the
+        // indexer's own error text.
+        sanitizeLogText(sampleId);
+        sanitizeLogText(sampleReason);
+    }
+
+    logWarn(IC_NAME,
+            "Delete by query on index '%s' completed with issues - version_conflicts: %d, failures: %zu, sample id: "
+            "'%s', sample reason: '%s'",
+            indexName.c_str(),
+            versionConflicts,
+            failures.size(),
+            sampleId.c_str(),
+            sampleReason.c_str());
+}
+
+/**
+ * @brief Report the issues carried by a response body that returned HTTP 200 overall, for both the `_bulk`
+ *        and the `_delete_by_query` shapes.
+ *
+ * @param indexName Name of the index the request was sent to.
+ * @param responseBody Raw response body.
+ */
+static inline void logResponseIssues(const std::string& indexName, const std::string& responseBody) noexcept
+{
+    // Skip the parse for the common, fully successful `_bulk` case: that body can reach several MB at full
+    // bulk size and holds nothing worth reporting. A `_delete_by_query` response never carries "errors":true
+    // regardless of its outcome, so it is told apart by its "failures" key instead - those bodies are small
+    // either way.
+    // Tolerate whitespace around the separator: a body serialized as `"errors" : true` must not slip
+    // through the fast path, or the rejections it carries would go unreported exactly as before this fix.
+    const auto errorsKey = responseBody.find(R"("errors")");
+    const auto hasBulkErrors = errorsKey != std::string::npos &&
+                               responseBody.find("true", errorsKey) < responseBody.find_first_of(",}", errorsKey);
+    const auto looksLikeDeleteByQuery = responseBody.find(R"("failures")") != std::string::npos;
+    if (!hasBulkErrors && !looksLikeDeleteByQuery)
+    {
+        return;
+    }
+
+    try
+    {
+        const auto responseJson = nlohmann::json::parse(responseBody);
+        logBulkItemErrors(responseJson, indexName);
+        logDeleteByQueryIssues(responseJson, indexName);
+    }
+    catch (const std::exception&)
+    {
+        logError(IC_NAME, "Failed to parse response body JSON.");
+    }
+}
+
 // ------- IndexerConnector methods implementation -------
 
 nlohmann::json IndexerConnector::getAgentDocumentsIds(const std::string& url,
@@ -407,9 +596,10 @@ void IndexerConnector::sendBulkReactive(const std::vector<std::pair<std::string,
 
     if (!bulkData.empty())
     {
-        const auto onSuccess = [](const std::string& response)
+        const auto onSuccess = [this](const std::string& response)
         {
             logDebug2(IC_NAME, "Response: %s", response.c_str());
+            logResponseIssues(m_indexName, response);
         };
 
         const auto onError = [this, &actions, &url, &secureCommunication, depth](
@@ -489,9 +679,17 @@ void IndexerConnector::diff(const nlohmann::json& responseJson,
         }
     }
 
-    // Iterate over the database and check if the element is in the status vector.
-    for (const auto& [key, value] : m_db->seek(agentId))
+    // Iterate over the database and check if the element is in the status vector. The trailing separator keeps
+    // this an exact per-agent scan: without it, a shorter agent ID prefix-matches a longer sibling's keys too
+    // (RocksDBIterator::valid() is a raw prefix check with no key-boundary awareness).
+    // Named local, not passed inline: seek() takes the key as a non-owning string_view and RocksDBIterator
+    // only reads through it lazily (on the range-for's begin()), so a temporary here would already be destroyed
+    // by the time it's read.
+    const auto agentPrefix = agentId + "_";
+    std::size_t mirrorEntryCount {0};
+    for (const auto& [key, value] : m_db->seek(agentPrefix))
     {
+        ++mirrorEntryCount;
         bool found {false};
         for (auto& [id, data] : status)
         {
@@ -512,13 +710,28 @@ void IndexerConnector::diff(const nlohmann::json& responseJson,
     }
 
     // Iterate over the status vector and check if the element is marked as not found.
-    // This means that the element is in the indexer but not in the database. To solve this, the element will be deleted
+    // This means that the element is in the indexer but not in the database. To solve this, the element will be
+    // deleted. An empty mirror is no exception: on a node that has never processed the agent (it has just moved
+    // there from another cluster node) this removes the previous node's documents, and the full sync the agent is
+    // sending to this node reinserts the current ones. The same deletion on a node that did process the agent means
+    // the mirror was lost, so the event is worth a log line either way.
+    std::size_t deletions {0};
     for (const auto& [id, data] : status)
     {
         if (!data)
         {
             actions.emplace_back(id, true);
+            ++deletions;
         }
+    }
+
+    if (mirrorEntryCount == 0 && deletions > 0)
+    {
+        logWarn(IC_NAME,
+                "Local mirror holds no entry for agent '%s': deleting the %zu document(s) the index reports for it. "
+                "Expected when the agent has just moved to this node; otherwise the mirror was lost.",
+                agentId.c_str(),
+                deletions);
     }
 
     auto url = selector->getNext();
@@ -571,10 +784,94 @@ void IndexerConnector::validateMappings(const nlohmann::json& templateData,
             throw std::runtime_error("Couldn't retrieve current mappings.");
         }
 
+        // The backup is looked up by its own name, which only needs access to that index.
+        const auto backupIndexUrl = [&]()
+        {
+            return selector->getNext() + "/" + m_indexName + "-backup";
+        };
+        const auto backupExists = [&]()
+        {
+            auto exists = true;
+            const auto onLookupError =
+                [&exists, &onError](const std::string& error, const long statusCode, const std::string& body)
+            {
+                if (statusCode != HTTP_NOT_FOUND)
+                {
+                    onError(error, statusCode, body);
+                }
+                exists = false;
+            };
+            HTTPRequest::instance().get(
+                RequestParameters {.url = HttpURL(backupIndexUrl() + "/_settings?filter_path=*.settings.index.uuid"),
+                                   .secureCommunication = secureCommunication},
+                PostRequestParameters {.onSuccess = onSuccess, .onError = onLookupError},
+                ConfigurationParameters {});
+            return exists;
+        };
+        const auto documentCount = [&](const std::string& indexName)
+        {
+            nlohmann::json countResponse;
+            HTTPRequest::instance().get(
+                RequestParameters {.url = HttpURL(selector->getNext() + "/" + indexName + "/_count?filter_path=count"),
+                                   .secureCommunication = secureCommunication},
+                PostRequestParameters {.onSuccess = [&countResponse](const std::string& response)
+                                       { countResponse = nlohmann::json::parse(response, nullptr, false); },
+                                       .onError = onError},
+                ConfigurationParameters {});
+
+            if (countResponse.is_discarded() || !countResponse.contains("count"))
+            {
+                throw std::runtime_error("Couldn't retrieve the document count of '" + indexName + "'.");
+            }
+            return countResponse.at("count").get<uint64_t>();
+        };
+
         // Calculating hashes.
         auto hashTemplateMappings = hashMappings(templateMappings.dump());
         auto hashCurrentMappings = hashMappings(currentMappings[m_indexName]["mappings"].dump());
-        if (hashTemplateMappings != hashCurrentMappings)
+        if (hashTemplateMappings == hashCurrentMappings)
+        {
+            // Matching mappings only prove that the index was recreated, not that the reindex from the backup
+            // finished, so the backup is deleted only when it holds no more documents than the index.
+            const auto removeOrphanBackup = [&]()
+            {
+                if (!backupExists())
+                {
+                    return;
+                }
+
+                const auto backupDocuments = documentCount(m_indexName + "-backup");
+                const auto indexDocuments = documentCount(m_indexName);
+                if (backupDocuments > indexDocuments)
+                {
+                    logWarn(IC_NAME,
+                            "Keeping backup index '%s-backup' with %llu documents: index '%s' holds %llu, so a "
+                            "migration may not have finished.",
+                            m_indexName.c_str(),
+                            static_cast<unsigned long long>(backupDocuments),
+                            m_indexName.c_str(),
+                            static_cast<unsigned long long>(indexDocuments));
+                    return;
+                }
+
+                logInfo(IC_NAME, "Deleting orphan backup index '%s-backup'.", m_indexName.c_str());
+                HTTPRequest::instance().delete_(
+                    RequestParameters {.url = HttpURL(backupIndexUrl()), .secureCommunication = secureCommunication},
+                    PostRequestParameters {.onSuccess = onSuccess, .onError = onError},
+                    ConfigurationParameters {});
+            };
+
+            // The cleanup is optional: a failure in it is not a failure of the mappings validation.
+            try
+            {
+                removeOrphanBackup();
+            }
+            catch (const std::exception& e)
+            {
+                logWarn(IC_NAME, "Unable to clean up the backup index '%s-backup': %s.", m_indexName.c_str(), e.what());
+            }
+        }
+        else
         {
             logDebug2(IC_NAME,
                       "Current mappings '%s' do not match the expected mappings '%s'.",
@@ -614,21 +911,11 @@ void IndexerConnector::validateMappings(const nlohmann::json& templateData,
                 R"(}}})";
 
             // Remove any previous backup if exists.
-            std::string currentIndices;
-            HTTPRequest::instance().get(
-                RequestParameters {.url = HttpURL(selector->getNext() + "/_cat/indices/"),
-                                   .secureCommunication = secureCommunication},
-                PostRequestParameters {.onSuccess = [&currentIndices](const std::string& response)
-                                       { currentIndices = response; },
-                                       .onError = onError},
-                ConfigurationParameters {});
-
-            if (currentIndices.find(m_indexName + "-backup") != std::string::npos)
+            if (backupExists())
             {
                 logDebug2(IC_NAME, "Deleting previous backup index '%s-backup'.", m_indexName.c_str());
                 HTTPRequest::instance().delete_(
-                    RequestParameters {.url = HttpURL(selector->getNext() + "/" + m_indexName + "-backup"),
-                                       .secureCommunication = secureCommunication},
+                    RequestParameters {.url = HttpURL(backupIndexUrl()), .secureCommunication = secureCommunication},
                     PostRequestParameters {.onSuccess = onSuccess, .onError = onError},
                     ConfigurationParameters {});
             }
@@ -930,12 +1217,6 @@ IndexerConnector::IndexerConnector(
         {
             std::scoped_lock lock(m_syncMutex);
 
-            if (!m_initialized && m_initializeThread.joinable())
-            {
-                logDebug2(IC_NAME, "Waiting for initialization thread to process events.");
-                m_initializeThread.join();
-            }
-
             if (m_stopping.load())
             {
                 logDebug2(IC_NAME, "IndexerConnector is stopping, event processing will be skipped.");
@@ -947,6 +1228,36 @@ IndexerConnector::IndexerConnector(
 
             // Accumulator for data to be sent to the indexer via query requests.
             nlohmann::json queryData;
+
+            // Requests in the order they have to reach the indexer (true: delete by query). Only the operations of
+            // the same agent have to keep their order: a delete by query must not run after the bulk that follows it,
+            // which would remove the documents that bulk has just indexed. So the pending queries are sent before the
+            // pending bulk, and the requests are cut only when a query arrives for an agent that already has
+            // operations in the bulk. The agent is the first field of an id, which is the node name for the manager
+            // agent in a cluster.
+            std::vector<std::pair<bool, std::string>> requests;
+            std::set<std::string> bulkAgents;
+            const auto agentOf = [](const std::string& id)
+            {
+                return id.substr(0, id.find('_'));
+            };
+            const auto flushBulk = [&bulkData, &bulkAgents, &requests]()
+            {
+                if (!bulkData.empty())
+                {
+                    requests.emplace_back(false, std::move(bulkData));
+                    bulkData.clear();
+                }
+                bulkAgents.clear();
+            };
+            const auto flushQuery = [&queryData, &requests]()
+            {
+                if (!queryData.empty())
+                {
+                    requests.emplace_back(true, queryData.dump());
+                    queryData.clear();
+                }
+            };
 
             while (!dataQueue.empty())
             {
@@ -980,21 +1291,49 @@ IndexerConnector::IndexerConnector(
                 {
                     if (m_useSeekDelete)
                     {
-                        for (const auto& [key, _] : m_db->seek(id))
+                        // Seek-delete publishers send the id without the version suffix their documents were
+                        // indexed with ("<id>_<suffix>", see InventorySync::updateElementID in the vulnerability
+                        // scanner), so the match is the exact id plus every key under "<id>_". A plain seek(id)
+                        // would also sweep siblings sharing the byte prefix (CVE-2023-100 when deleting
+                        // CVE-2023-1), and those sort before "<id>_", so the prefix scan has to be its own seek.
+                        const auto deleteKey = [&](const std::string& key)
                         {
                             logDebug2(IC_NAME, "Added document for deletion with id: %s.", key.c_str());
                             if (!noIndex)
                             {
+                                bulkAgents.insert(agentOf(key));
                                 builderBulkDelete(bulkData, key, m_indexName);
                             }
 
                             m_db->delete_(key);
+                        };
+
+                        if (id.empty())
+                        {
+                            // An empty id would match every key under "_"; the exact lookup rejects it anyway.
+                            logWarn(IC_NAME, "Ignoring DELETED event with an empty id: %s", data.c_str());
+                        }
+                        else
+                        {
+                            if (std::string value; m_db->get(id, value))
+                            {
+                                deleteKey(id);
+                            }
+
+                            // Named local: seek() only borrows the key as a string_view, read lazily on the
+                            // loop's begin() - a temporary here would already be gone by then.
+                            const auto idPrefix = id + "_";
+                            for (const auto& [key, _] : m_db->seek(idPrefix))
+                            {
+                                deleteKey(key);
+                            }
                         }
                     }
                     else
                     {
                         if (!noIndex)
                         {
+                            bulkAgents.insert(agentOf(id));
                             builderBulkDelete(bulkData, id, m_indexName);
                         }
 
@@ -1006,10 +1345,18 @@ IndexerConnector::IndexerConnector(
                     logDebug2(IC_NAME, "Added document for deletion by query with id: %s.", id.c_str());
                     if (!noIndex)
                     {
+                        if (bulkAgents.count(agentOf(id)))
+                        {
+                            flushQuery();
+                            flushBulk();
+                        }
                         builderDeleteByQuery(queryData, id);
                     }
 
-                    for (const auto& [key, _] : m_db->seek(id))
+                    // Named local: seek() only borrows the key as a string_view, read lazily on the loop's
+                    // begin() - a temporary here would already be gone by then.
+                    const auto idPrefix = id + "_";
+                    for (const auto& [key, _] : m_db->seek(idPrefix))
                     {
                         m_db->delete_(key);
                     }
@@ -1027,6 +1374,7 @@ IndexerConnector::IndexerConnector(
                     const auto dataString = parsedData.at("data").dump();
                     if (!noIndex)
                     {
+                        bulkAgents.insert(agentOf(id));
                         builderBulkIndex(bulkData, id, m_indexName, dataString);
                     }
                     m_db->put(id, dataString);
@@ -1042,6 +1390,7 @@ IndexerConnector::IndexerConnector(
                 const auto onSuccess = [this, bulkSize](const std::string& response)
                 {
                     logDebug2(IC_NAME, "Response: %s", response.c_str());
+                    logResponseIssues(m_indexName, response);
 
                     // If the request was successful and the current bulk size is less than ELEMENTS_PER_BULK, increase
                     // the bulk size if the success count is SUCCESS_COUNT_TO_INCREASE_BULK_SIZE
@@ -1164,18 +1513,35 @@ IndexerConnector::IndexerConnector(
                     {});
             };
 
-            const auto serverUrl = selector->getNext();
+            flushQuery();
+            flushBulk();
 
-            if (!bulkData.empty())
+            // Only what goes to the indexer needs it: the operations flagged no-index have already been applied to the
+            // local mirror, so they neither wait for its initialization nor for an available server.
+            if (requests.empty())
             {
-                const auto url = serverUrl + "/_bulk?refresh=wait_for";
-                processData(bulkData, url);
+                return;
             }
 
-            if (!queryData.empty())
+            if (!m_initialized && m_initializeThread.joinable())
             {
-                const auto url = serverUrl + "/" + m_indexName + "/_delete_by_query";
-                processData(queryData.dump(), url);
+                logDebug2(IC_NAME, "Waiting for initialization thread to process events.");
+                m_initializeThread.join();
+            }
+
+            if (m_stopping.load())
+            {
+                logDebug2(IC_NAME, "IndexerConnector is stopping, event processing will be skipped.");
+                throw std::runtime_error("IndexerConnector is stopping, event processing will be skipped.");
+            }
+
+            const auto serverUrl = selector->getNext();
+
+            for (const auto& [isQuery, payload] : requests)
+            {
+                const auto url = isQuery ? serverUrl + "/" + m_indexName + "/_delete_by_query?ignore_unavailable=true"
+                                         : serverUrl + "/_bulk?refresh=wait_for";
+                processData(payload, url);
             }
         },
         DATABASE_BASE_PATH + m_indexName,
@@ -1310,9 +1676,24 @@ IndexerConnector::IndexerConnector(
                 {
                     if (m_useSeekDelete)
                     {
-                        for (const auto& [key, _] : m_db->seek(id))
+                        // Same match as the index-enabled constructor's DELETED branch: the exact id plus every
+                        // versioned key under "<id>_", never a sibling that merely shares the byte prefix. With no
+                        // bulk request to build, deleting a key that is not there is a harmless no-op.
+                        if (id.empty())
                         {
-                            m_db->delete_(key);
+                            logWarn(IC_NAME, "Ignoring DELETED event with an empty id: %s", data.c_str());
+                        }
+                        else
+                        {
+                            m_db->delete_(id);
+
+                            // Named local: seek() only borrows the key as a string_view, read lazily on the
+                            // loop's begin() - a temporary here would already be gone by then.
+                            const auto idPrefix = id + "_";
+                            for (const auto& [key, _] : m_db->seek(idPrefix))
+                            {
+                                m_db->delete_(key);
+                            }
                         }
                     }
                     else
@@ -1323,7 +1704,10 @@ IndexerConnector::IndexerConnector(
                 // We made the same operation for DELETED_BY_QUERY as for DELETED
                 else if (parsedData.at("operation").get_ref<const std::string&>().compare("DELETED_BY_QUERY") == 0)
                 {
-                    for (const auto& [key, _] : m_db->seek(id))
+                    // Named local: seek() only borrows the key as a string_view, read lazily on the loop's
+                    // begin() - a temporary here would already be gone by then.
+                    const auto idPrefix = id + "_";
+                    for (const auto& [key, _] : m_db->seek(idPrefix))
                     {
                         m_db->delete_(key);
                     }

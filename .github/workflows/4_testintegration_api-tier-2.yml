@@ -8,15 +8,22 @@ on:
         required: true
         default: 'main'
 
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
   build:
     env:
       BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
       BRANCH_BASE: ${{ github.base_ref || inputs.base_branch }}
-    runs-on: wz-linux-amd64
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v3
+      - name: Install system build dependencies
+        # TODO: Remove when added to CodeBuild base images
+        run: sudo apt-get update && sudo apt-get install -y python3-pip
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
@@ -24,6 +31,21 @@ jobs:
           architecture: x64
       - name: "Install a compatible CMake"
         uses: ./.github/actions/reinstall_cmake
+      # Compilation cache (issue 38139). Skipped on fork PRs (no credentials).
+      - name: "Configure AWS credentials for the compilation cache"
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          aws-region: ${{ secrets.CI_AWS_REGION }}
+          role-duration-seconds: 7200
+      - name: "Set up sccache"
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/setup-sccache
+        with:
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          region: ${{ secrets.CI_AWS_REGION }}
+          key-prefix: sccache/4.14.8
       # Build wazuh server for linux.
       - name: Build wazuh server for linux
         run: |
@@ -76,7 +98,7 @@ jobs:
               QA_BRANCH="main"
           fi
           git clone -b ${QA_BRANCH} --single-branch https://github.com/wazuh/qa-integration-framework.git
-          sudo pip install --ignore-installed qa-integration-framework/
+          sudo pip install --ignore-installed --break-system-packages qa-integration-framework/
           sudo rm -rf qa-integration-framework/
       # Run integration tests.
       - name: Run API tests
@@ -95,7 +117,13 @@ jobs:
       # Upload logs artifact if test fails
       - name: Upload logs artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: ./.github/actions/upload_s3_artifact
         with:
+          aws_region: ${{ secrets.CI_AWS_REGION }}
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
           name: wazuh-logs-${{ github.job }}
           path: /tmp/wazuh-logs
+      - name: "Compilation cache statistics"
+        if: always()
+        run: sccache --show-stats 2>/dev/null | grep -viE "cache location|bucket" || true

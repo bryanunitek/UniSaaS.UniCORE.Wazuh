@@ -5,7 +5,6 @@
 import asyncio
 import itertools
 import logging
-import ssl
 import traceback
 from time import perf_counter
 from typing import Tuple, Dict, List
@@ -21,7 +20,7 @@ class AbstractClientManager:
     Define an abstract client. Manage connection with server.
     """
 
-    def __init__(self, configuration: Dict, cluster_items: Dict, enable_ssl: bool, performance_test: int,
+    def __init__(self, configuration: Dict, cluster_items: Dict, performance_test: int,
                  concurrency_test: int, file: str, string: int, logger: logging.Logger = None,
                  tag: str = "Client Manager"):
         """Class constructor.
@@ -32,8 +31,6 @@ class AbstractClientManager:
             Client configuration.
         cluster_items : dict
             Cluster.json object containing cluster internal variables.
-        enable_ssl : bool
-            Whether to use SSL encryption or not.
         performance_test : int
             Value for the performance test function.
         concurrency_test : int
@@ -50,7 +47,6 @@ class AbstractClientManager:
         self.name = configuration['node_name']
         self.configuration = configuration
         self.cluster_items = cluster_items
-        self.ssl = enable_ssl
         self.performance_test = performance_test
         self.concurrency_test = concurrency_test
         self.file = file
@@ -94,7 +90,6 @@ class AbstractClientManager:
         asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
         self.loop.set_exception_handler(common.asyncio_exception_handler)
         on_con_lost = self.loop.create_future()
-        ssl_context = ssl.create_default_context(purpose=ssl.Purpose.CLIENT_AUTH) if self.ssl else None
 
         while True:
             try:
@@ -104,8 +99,7 @@ class AbstractClientManager:
                                                                 fernet_key=self.configuration['key'],
                                                                 cluster_items=self.cluster_items,
                                                                 manager=self, **self.extra_args),
-                    host=self.configuration['nodes'][0], port=self.configuration['port'],
-                    ssl=ssl_context)
+                    host=self.configuration['nodes'][0], port=self.configuration['port'])
                 self.client = protocol
             except ConnectionRefusedError:
                 self.logger.error("Could not connect to master. Trying again in 10 seconds.")
@@ -204,8 +198,14 @@ class AbstractClient(common.Handler):
             'None' means a regular EOF is received, or the connection was aborted or closed
             by this side of the connection.
         """
+        self._cancel_payload_deadline()
         if exc is None:
             self.logger.info('The master closed the connection')
+        elif isinstance(exc, (ConnectionResetError, ConnectionAbortedError)):
+            # The peer forcibly closed the connection (e.g. a TCP reset while the master was shutting down).
+            # This is transient and recoverable: the client automatically retries the connection, so it is
+            # logged as a warning instead of an error.
+            self.logger.warning(f"Connection closed by the peer: {exc}. Reconnecting...")
         else:
             self.logger.error(f"Connection closed due to an unhandled error: {exc}\n"
                               f"{''.join(traceback.format_tb(exc.__traceback__))}", exc_info=False)
@@ -213,6 +213,9 @@ class AbstractClient(common.Handler):
         if not self.on_con_lost.done():
             self.on_con_lost.set_result(True)
         self._cancel_all_tasks()
+
+        if self.server is not None and self.server.client is self:
+            self.server.client = None
 
     def _cancel_all_tasks(self):
         """Cancel all asyncio tasks and clients."""

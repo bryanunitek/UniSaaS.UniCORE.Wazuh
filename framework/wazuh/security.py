@@ -223,13 +223,16 @@ def update_user(user_id: str = None, password: str = None, current_user: str = N
     """
     if password is None:
         raise WazuhError(4001)
-    if password:
+    if password is not None:
         if len(password) > 64 or len(password) < 8:
             raise WazuhError(5009)
         elif not _user_password.match(password):
             raise WazuhError(5007)
 
-        if int(user_id[0]) <= MAX_ID_RESERVED and current_user is not None:
+        if int(user_id[0]) <= MAX_ID_RESERVED:
+            if current_user is None:
+                raise WazuhError(5011)
+
             with AuthenticationManager() as auth_manager:
                 current_user_id = auth_manager.get_user(current_user)['id']
 
@@ -1234,7 +1237,6 @@ def get_api_endpoints() -> list:
     return endpoints_list
 
 
-@lru_cache(maxsize=None)
 @expose_resources(actions=['security:read_config'], resources=['*:*:*'])
 def get_rbac_resources(resource: str = None) -> WazuhResult:
     """Get the RBAC resources from the catalog.
@@ -1262,7 +1264,6 @@ def get_rbac_resources(resource: str = None) -> WazuhResult:
         return WazuhResult({'data': {resource: load_spec()['x-rbac-catalog']['resources'][resource]}})
 
 
-@lru_cache(maxsize=None)
 @expose_resources(actions=['security:read_config'], resources=['*:*:*'])
 def get_rbac_actions(endpoint: str = None) -> WazuhResult:
     """Get the RBAC actions from the catalog.

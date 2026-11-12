@@ -63,7 +63,7 @@ abstract_client = client.AbstractClient(loop=None, on_con_lost=future_mock, name
                                         logger=None, manager=None, cluster_items=cluster_items)
 with patch("asyncio.get_running_loop"):
     abstract_client_manager = client.AbstractClientManager(configuration=configuration, cluster_items=cluster_items,
-                                                           enable_ssl=True, performance_test=10,
+                                                           performance_test=10,
                                                            concurrency_test=10, file="/file/path", string=1000)
 
 
@@ -75,7 +75,6 @@ def test_acm_init():
     assert abstract_client_manager.name == "manager"
     assert abstract_client_manager.configuration == configuration
     assert abstract_client_manager.cluster_items == cluster_items
-    assert abstract_client_manager.ssl is True
     assert abstract_client_manager.performance_test == 10
     assert abstract_client_manager.concurrency_test == 10
     assert abstract_client_manager.file == "/file/path"
@@ -281,6 +280,15 @@ def test_ac_connection_lost(cancel_tasks_mock):
         abstract_client.connection_lost(exc=WazuhException(1001))
         logger_mock.assert_called_once_with(f"Connection closed due to an unhandled error: {WazuhException(1001)}\n",
                                             exc_info=False)
+
+    # Test that a connection reset/aborted by the peer is logged as a warning, not an error
+    for reset_exc in (ConnectionResetError('[Errno 104] Connection reset by peer'), ConnectionAbortedError()):
+        with patch.object(logging.getLogger('wazuh'), "warning") as warning_logger_mock:
+            with patch.object(logging.getLogger('wazuh'), "error") as error_logger_mock:
+                abstract_client.connection_lost(exc=reset_exc)
+                warning_logger_mock.assert_called_once_with(f"Connection closed by the peer: {reset_exc}. "
+                                                            f"Reconnecting...")
+                error_logger_mock.assert_not_called()
 
 def test_ac_cancel_all_tasks():
     """Check whether all tasks and connections are being properly closed."""

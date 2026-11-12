@@ -391,14 +391,16 @@ async def test_async_decompress_files(decompress_files_mock):
 
 
 @pytest.mark.asyncio
-@patch('zlib.decompress')
+@patch('wazuh.core.cluster.cluster.get_cluster_items',
+       return_value={'intervals': {'communication': {'max_zip_size': 1073741824}}})
+@patch('wazuh.core.cluster.cluster.decompress_to_file', side_effect=[100, 200])
 @patch('os.makedirs')
 @patch('os.path.exists', side_effect=[False, True, True])
 @patch('wazuh.core.cluster.cluster.remove')
 @patch('wazuh.core.cluster.cluster.mkdir_with_mode')
 @patch('json.loads', return_value="some string with files")
 async def test_decompress_files_ok(json_loads_mock, mkdir_with_mode_mock, remove_mock, os_path_exists_mock,
-                                   mock_makedirs, zlib_mock):
+                                   mock_makedirs, decompress_to_file_mock, get_cluster_items_mock):
     """Check if the decompressing function is working properly."""
     zip_path = '/foo/bar/'
     compress_data = f'path{cluster.PATH_SEP}content{cluster.FILE_SEP}path2{cluster.PATH_SEP}content2'.encode()
@@ -410,20 +412,78 @@ async def test_decompress_files_ok(json_loads_mock, mkdir_with_mode_mock, remove
         ko_files, zip_dir = cluster.decompress_files(compress_path=zip_path)
         assert ko_files == "some string with files"
         assert zip_dir == zip_path + 'dir'
-        zlib_mock.assert_has_calls([call(b'content'), call(b'content2')])
+        # The second member's budget must be reduced by the first member's decompressed size,
+        # exercising the rolling 'max_zip_size - total_decompressed' aggregate budget.
+        decompress_to_file_mock.assert_has_calls([call(b'content', '/foo/bar/dir/path', 1073741824),
+                                                  call(b'content2', '/foo/bar/dir/path2', 1073741824 - 100)])
         mock_makedirs.assert_called_once_with(zip_path + 'dir')
         json_loads_mock.assert_called_once()
         mkdir_with_mode_mock.assert_called_once_with(zip_dir)
         remove_mock.assert_called_once_with(zip_path)
-        assert open_mock.call_args_list == [call('/foo/bar/', 'rb'), call('/foo/bar/dir/path', 'wb'),
-                                            call('/foo/bar/dir/path2', 'wb'), call('/foo/bar/dir/files_metadata.json')]
+        assert open_mock.call_args_list == [call('/foo/bar/', 'rb'), call('/foo/bar/dir/files_metadata.json')]
+
+
+def test_decompress_to_file_ok(tmp_path):
+    """Check that a compressed member is decompressed and written to disk."""
+    content = b'A' * 1024
+    dest = str(tmp_path / 'out.bin')
+
+    written = cluster.decompress_to_file(zlib.compress(content), dest, max_size=1024 * 1024)
+
+    assert written == len(content)
+    with open(dest, 'rb') as f:
+        assert f.read() == content
+
+
+def test_decompress_to_file_exceeds_limit(tmp_path):
+    """Check that a decompression bomb is rejected once the size cap is exceeded."""
+    # ~100 MiB of 'A' compresses to a few KiB but must be rejected when the cap is lower.
+    co = zlib.compressobj(9)
+    parts = [co.compress(b'A' * (1024 * 1024)) for _ in range(100)]
+    parts.append(co.flush())
+    bomb = b''.join(parts)
+    dest = str(tmp_path / 'bomb.bin')
+
+    with pytest.raises(WazuhInternalError, match=r'.* 3053 .*'):
+        cluster.decompress_to_file(bomb, dest, max_size=10 * 1024 * 1024)
+
+
+def test_decompress_to_file_truncated(tmp_path):
+    """Check that a truncated/corrupted member is rejected instead of silently accepted."""
+    compressed = zlib.compress(b'Z' * 4096)
+    dest = str(tmp_path / 'trunc.bin')
+
+    with pytest.raises(zlib.error):
+        cluster.decompress_to_file(compressed[:-2], dest, max_size=1024 * 1024)
+
+
+@patch('wazuh.core.cluster.cluster.get_cluster_items',
+       return_value={'intervals': {'communication': {'max_zip_size': 1500}}})
+def test_decompress_files_aggregate_limit(get_cluster_items_mock, tmp_path):
+    """Two members each under the cap but exceeding it in aggregate must be rejected."""
+    path_sep = cluster.PATH_SEP.encode()
+    file_sep = cluster.FILE_SEP.encode()
+    archive = (b'a.txt' + path_sep + zlib.compress(b'A' * 1000) + file_sep +
+               b'b.txt' + path_sep + zlib.compress(b'B' * 1000) + file_sep +
+               b'pad' + path_sep + zlib.compress(b''))
+    zip_path = str(tmp_path / 'agg.zip')
+    with open(zip_path, 'wb') as f:
+        f.write(archive)
+
+    with pytest.raises(WazuhInternalError, match=r'.* 3053 .*'):
+        cluster.decompress_files(zip_path)
+
+    # On rejection, decompress_files must remove the partial decompressed output.
+    assert not os.path.exists(zip_path + 'dir')
 
 
 @pytest.mark.asyncio
+@patch('wazuh.core.cluster.cluster.get_cluster_items',
+       return_value={'intervals': {'communication': {'max_zip_size': 1073741824}}})
 @patch('shutil.rmtree')
-@patch('zlib.decompress', return_value=Exception)
+@patch('wazuh.core.cluster.cluster.decompress_to_file', side_effect=Exception)
 @patch('wazuh.core.cluster.cluster.mkdir_with_mode')
-async def test_decompress_files_ko(mkdir_with_mode_mock, zlib_mock, rmtree_mock):
+async def test_decompress_files_ko(mkdir_with_mode_mock, decompress_to_file_mock, rmtree_mock, get_cluster_items_mock):
     """Check if the decompressing function is raising the necessary exceptions."""
 
     # Raising the expected Exception
@@ -433,7 +493,7 @@ async def test_decompress_files_ko(mkdir_with_mode_mock, zlib_mock, rmtree_mock)
         with patch('os.path.exists', return_value=True) as os_path_exists_mock:
             assert cluster.decompress_files(zip_dir) == "some string with files", zip_dir + "dir"
             mkdir_with_mode_mock.assert_called_once_with(zip_dir)
-            zlib_mock.assert_called_once()
+            decompress_to_file_mock.assert_called_once()
             os_path_exists_mock.assert_called_once()
             rmtree_mock.assert_called_once()
 
@@ -498,13 +558,13 @@ def test_compare_files_ko(logger_mock, mock_get_cluster_items):
 def test_clean_up_ok():
     """Check if the cleaning function is working properly."""
 
-    with patch('os.path.join', return_value="some/path/"):
+    with patch('wazuh.core.cluster.cluster.safe_join', return_value="some/path"):
         with patch.object(wazuh.core.cluster.cluster.logger, "debug") as mock_logger:
             with patch('os.path.exists', return_value=False) as path_exists_mock:
                 cluster.clean_up("worker1")
-                mock_logger.assert_any_call("Removing 'some/path/'.")
-                mock_logger.assert_any_call("Nothing to remove in 'some/path/'.")
-                mock_logger.assert_called_with("Removed 'some/path/'.")
+                mock_logger.assert_any_call("Removing 'some/path'.")
+                mock_logger.assert_any_call("Nothing to remove in 'some/path'.")
+                mock_logger.assert_called_with("Removed 'some/path'.")
 
                 path_exists_mock.return_value = True
                 with patch('wazuh.core.cluster.cluster.listdir',
@@ -512,38 +572,43 @@ def test_clean_up_ok():
                     with patch('os.path.isdir', return_value=True) as is_dir_mock:
                         with patch('shutil.rmtree'):
                             cluster.clean_up("worker1")
-                            mock_logger.assert_any_call("Removing 'some/path/'.")
-                            mock_logger.assert_called_with("Removed 'some/path/'.")
+                            mock_logger.assert_any_call("Removing 'some/path'.")
+                            mock_logger.assert_called_with("Removed 'some/path'.")
 
                         is_dir_mock.return_value = False
                         with patch('wazuh.core.cluster.cluster.remove'):
                             cluster.clean_up("worker1")
-                            mock_logger.assert_any_call("Removing 'some/path/'.")
-                            mock_logger.assert_called_with("Removed 'some/path/'.")
+                            mock_logger.assert_any_call("Removing 'some/path'.")
+                            mock_logger.assert_called_with("Removed 'some/path'.")
 
 
 def test_clean_up_ko():
     """Check if the cleaning function raising the exceptions properly."""
-    error_cleaning = "Error cleaning up: stat: path should be string, bytes, os.PathLike or integer, not type."
-    error_removing = f"Error removing '{Exception}': " \
-                     f"'stat: path should be string, bytes, os.PathLike or integer, not type'."
+    error_removing = "Error removing 'some/path/other_file.txt': 'test error'."
 
-    with patch('os.path.join') as path_join_mock:
+    with patch('wazuh.core.cluster.cluster.safe_join', return_value="some/path"):
         with patch.object(wazuh.core.cluster.cluster.logger, "error") as mock_error_logger:
             with patch.object(wazuh.core.cluster.cluster.logger, "debug") as mock_debug_logger:
-                path_join_mock.return_value = Exception
-                cluster.clean_up("worker1")
-                mock_debug_logger.assert_any_call(f"Removing '{Exception}'.")
-                mock_error_logger.assert_called_once_with(error_cleaning)
-
                 with patch('os.path.exists', return_value=True):
                     with patch('wazuh.core.cluster.cluster.listdir',
                                return_value=["c-internal.sock", "other_file.txt"]):
-                        with patch('shutil.rmtree', side_effect=Exception):
-                            cluster.clean_up("worker1")
-                            mock_debug_logger.assert_any_call(f"Removing '{Exception}'.")
-                            mock_error_logger.assert_any_call(error_removing)
-                            mock_debug_logger.assert_called_with(f"Removed '{Exception}'.")
+                        with patch('os.path.isdir', return_value=True):
+                            with patch('shutil.rmtree', side_effect=Exception("test error")):
+                                cluster.clean_up("worker1")
+                                mock_debug_logger.assert_any_call("Removing 'some/path'.")
+                                mock_error_logger.assert_any_call(error_removing)
+                                mock_debug_logger.assert_called_with("Removed 'some/path'.")
+
+
+def test_clean_up_node_name_validation():
+    """Check that clean_up rejects invalid node names."""
+    with patch('wazuh.core.cluster.cluster.safe_join') as safe_join_mock:
+        safe_join_mock.side_effect = WazuhInternalError(3003, extra_message="unsafe path")
+
+        with patch.object(wazuh.core.cluster.cluster.logger, "error") as mock_error_logger:
+            cluster.clean_up("../../etc")
+            mock_error_logger.assert_called_once()
+            assert "Error cleaning up" in str(mock_error_logger.call_args)
 
 
 @patch('wazuh.core.cluster.cluster.listdir', return_value=['005', '006'])
@@ -576,16 +641,65 @@ def test_unmerge_info():
         with patch('wazuh.core.cluster.cluster.stat') as stat_mock:
             # Make sure that the function is running correctly
             stat_mock.return_value.st_size = len(agent_info) - 5
-            assert list(cluster.unmerge_info("destination/directory/", "path/file/", "filename")) == [
-                ('queue/destination/directory/005', b"b'default,windows-serve", '2019-03-29 14:57:29.610934')]
+            assert list(cluster.unmerge_info("destination", "path/file/", "filename")) == [
+                ('queue/destination/005', b"b'default,windows-serve", '2019-03-29 14:57:29.610934')]
 
             # Make sure that the Exception is being properly called
             stat_mock.return_value.st_size = len(agent_info)
             with patch.object(wazuh.core.cluster.cluster.logger, "warning") as mock_logger:
-                list(cluster.unmerge_info("destination/directory/", "path/file/", "filename"))
+                list(cluster.unmerge_info("destination", "path/file/", "filename"))
                 mock_logger.assert_called_once_with("Malformed file (not enough values to unpack "
                                                     "(expected 3, got 1)). Parsed line: rs'. "
                                                     "Some files won't be synced")
+
+
+@pytest.mark.parametrize('merge_type, filename, expected_exception', [
+    ("../etc", "payload.merged", True),
+    ("..\\etc", "payload.merged", True),
+    (".hidden", "payload.merged", True),
+    ("valid/path", "payload.merged", True),
+    ("valid", "../../../etc/ossec.conf", True),
+    ("valid", "..\\..\\..\\etc\\ossec.conf", True),
+    ("valid", ".hidden", True),
+    ("valid", "file/with/slash", True),
+])
+def test_unmerge_info_path_validation(merge_type, filename, expected_exception):
+    """Test that unmerge_info validates merge_type and filename parameters."""
+    agent_info = b"23 005 2019-03-29 14:57:29.610934\ndefault"
+
+    with patch('builtins.open', mock_open(read_data=agent_info)):
+        with patch('wazuh.core.cluster.cluster.stat') as stat_mock:
+            stat_mock.return_value.st_size = len(agent_info)
+
+            if expected_exception:
+                with pytest.raises(WazuhException, match='3052'):
+                    list(cluster.unmerge_info(merge_type, "path/file/", filename))
+
+
+@pytest.mark.parametrize('header_name, should_skip', [
+    ("../../../etc/ossec.conf", False),
+    ("..\\..\\..\\etc\\ossec.conf", True),
+    (".hidden", True),
+    ("valid_file.txt", False),
+])
+def test_unmerge_info_header_name_sanitization(header_name, should_skip):
+    """Test that unmerge_info sanitizes file names from merged headers."""
+    agent_info = f"12 {header_name} 2019-03-29 14:57:29.610934\ntest_content".encode()
+
+    with patch('builtins.open', mock_open(read_data=agent_info)):
+        with patch('wazuh.core.cluster.cluster.stat') as stat_mock:
+            stat_mock.return_value.st_size = len(agent_info)
+
+            with patch.object(wazuh.core.cluster.cluster.logger, "warning") as mock_logger:
+                result = list(cluster.unmerge_info("valid", "path/file/", "filename"))
+
+                if should_skip:
+                    assert len(result) == 0
+                    mock_logger.assert_called()
+                else:
+                    assert len(result) == 1
+                    expected_basename = os.path.basename(header_name)
+                    assert result[0][0] == f"queue/valid/{expected_basename}"
 
 
 @pytest.mark.asyncio
