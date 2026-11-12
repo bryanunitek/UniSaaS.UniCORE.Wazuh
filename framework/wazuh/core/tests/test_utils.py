@@ -712,6 +712,29 @@ def test_plain_dict_to_nested_dict():
      {'localfile': {'allow': False, 'exceptions': []},
       'wodle_command': {'allow': False, 'exceptions': []}},
      False),
+
+    # Test case where the command log_format tag name is uppercased with a lowercase decoy (should raise when not allowed)
+    ("<ossec_config><localfile><log_format>syslog</log_format><LOG_FORMAT>full_command</LOG_FORMAT>"
+     "<command>id</command></localfile></ossec_config>",
+     "<ossec_config><localfile><log_format>syslog</log_format><location>/var/log/test.log</location></localfile></ossec_config>",
+     {'localfile': {'allow': False, 'exceptions': []},
+      'wodle_command': {'allow': True, 'exceptions': []}},
+     True),
+
+    # Test case where the command log_format tag name uses mixed case (should raise when not allowed)
+    ("<ossec_config><localfile><log_format>syslog</log_format><Log_Format>command</Log_Format>"
+     "<command>echo test</command></localfile></ossec_config>",
+     "<ossec_config><localfile><log_format>syslog</log_format><location>/var/log/test.log</location></localfile></ossec_config>",
+     {'localfile': {'allow': False, 'exceptions': []},
+      'wodle_command': {'allow': True, 'exceptions': []}},
+     True),
+
+    # Test case where the wodle command tag name is uppercased (should raise when not allowed)
+    ('<ossec_config><wodle name="command"><COMMAND>ls -la</COMMAND></wodle></ossec_config>',
+     '<ossec_config><wodle name="command"><tag>value</tag></wodle></ossec_config>',
+     {'localfile': {'allow': True, 'exceptions': []},
+      'wodle_command': {'allow': False, 'exceptions': []}},
+     True),
 ])
 def test_check_remote_commands(new_conf, original_conf, allow_config, should_raise):
     """Tests check_remote_commands with different remote command inputs."""
@@ -1427,6 +1450,59 @@ def test_WazuhDBQuery_substitute_params(mock_socket_conn, mock_conn_db, mock_glo
     query._get_total_items()
 
     mock_conn_db.assert_called_once_with()
+
+
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_substitute_params_values(mock_socket_conn, mock_conn_db, mock_glob, mock_exists):
+    """Strings are quoted, ints and floats are not, whether scalar or inside a list."""
+    backend = utils.WazuhDBBackend(agent_id=0)
+    assert backend._substitute_params("a = :a AND b = :b", {'a': 'hello', 'b': 5}) == "a = 'hello' AND b = 5"
+    assert backend._substitute_params("id IN (:ids)", {'ids': ['001', '002', 'abc']}) == "id IN ('001','002','abc')"
+    assert backend._substitute_params("name IN (:names)", {'names': ['007']}) == "name IN ('007')"
+    assert backend._substitute_params("name NOT IN (:names)", {'names': ['00', '0123']}) == "name NOT IN ('00','0123')"
+    assert backend._substitute_params("id IN (:ids)", {'ids': ['007', 5, 1.5]}) == "id IN ('007',5,1.5)"
+    assert backend._substitute_params("no placeholders", {}) == "no placeholders"
+    with pytest.raises(TypeError):
+        backend._substitute_params("x = :x", {'x': object()})
+
+
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_substitute_params_prefix_collision(mock_socket_conn, mock_conn_db, mock_glob, mock_exists):
+    """A placeholder that is a prefix of another is not matched partially."""
+    backend = utils.WazuhDBBackend(agent_id=0)
+    result = backend._substitute_params("name LIKE :search OR id LIKE :search_id",
+                                        {'search': '%foo%', 'search_id': 'foo'})
+    assert result == "name LIKE '%foo%' OR id LIKE 'foo'"
+
+
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_substitute_params_single_pass(mock_socket_conn, mock_conn_db, mock_glob, mock_exists):
+    """A value equal to another placeholder name is not substituted a second time."""
+    backend = utils.WazuhDBBackend(agent_id=0)
+    # A key with '$' (as the query builder produces) whose value looks like the ':b' placeholder.
+    result = backend._substitute_params("x = :a$0 AND y = :b", {'a$0': ':b', 'b': 'value_b'})
+    # ':a$0' resolves to the literal ':b'; the replacement text is not scanned again for :b.
+    assert result == "x = ':b' AND y = 'value_b'"
+
+
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_substitute_params_quote_escaping(mock_socket_conn, mock_conn_db, mock_glob, mock_exists):
+    """Single quotes in a value are escaped by doubling so a value cannot terminate its literal."""
+    backend = utils.WazuhDBBackend(agent_id=0)
+    assert backend._substitute_params("name = :n", {'n': "O'Brien"}) == "name = 'O''Brien'"
+    assert backend._substitute_params("name = :n", {'n': "a'b'c"}) == "name = 'a''b''c'"
 
 
 @patch('wazuh.core.utils.path.exists', return_value=True)

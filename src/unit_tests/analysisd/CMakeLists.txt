@@ -48,6 +48,7 @@ list(APPEND analysisd_flags "-Wl,--wrap,OS_ConnectUnixDomain -Wl,--wrap,OS_SendS
 
 list(APPEND analysisd_names "test_exec")
 list(APPEND analysisd_flags "-Wl,--wrap,OS_SendUnix -Wl,--wrap,wdb_get_agent_info -Wl,--wrap,Eventinfo_to_jsonstr \
+                             -Wl,--wrap,OS_SetSendTimeout \
                              -Wl,--wrap,OS_ReadXML -Wl,--wrap,OS_GetOneContentforElement -Wl,--wrap,OS_ClearXML -Wl,--wrap,StartMQ \
                              -Wl,--wrap,wdb_get_agents_by_connection_status -Wl,--wrap,labels_find -Wl,--wrap,labels_get -Wl,--wrap,labels_free \
                              -Wl,--wrap,OS_IPFoundList \
@@ -69,7 +70,8 @@ list(APPEND analysisd_flags "-Wl,--wrap,wdbc_connect_with_attempts -Wl,--wrap,wd
 
 list(APPEND analysisd_names "test_rules")
 LIST(APPEND analysisd_flags "-Wl,--wrap,_mwarn -Wl,--wrap,_merror -Wl,--wrap,_os_analysisd_add_logmsg \
-                             -Wl,--wrap,OS_ClearNode -Wl,--wrap,w_get_attr_val_by_name ${DEBUG_OP_WRAPPERS}")
+                             -Wl,--wrap,OS_ClearNode -Wl,--wrap,w_get_attr_val_by_name \
+                             -Wl,--wrap,getDefine_String -Wl,--wrap,w_get_memory_size ${DEBUG_OP_WRAPPERS}")
 
 LIST(APPEND analysisd_names "test_same_different_loop")
 LIST(APPEND analysisd_flags "-W")
@@ -143,7 +145,7 @@ LIST(APPEND analysisd_flags "-Wl,--wrap,OSMatch_FreePattern")
 
 LIST(APPEND analysisd_names "test_rule_list")
 LIST(APPEND analysisd_flags "-Wl,--wrap,OSMatch_FreePattern -Wl,--wrap,OSRegex_FreePattern -Wl,--wrap,os_remove_cdbrules \
-                            -Wl,--wrap,_os_analysisd_add_logmsg -Wl,--wrap,OS_IsValidIP")
+                            -Wl,--wrap,_os_analysisd_add_logmsg -Wl,--wrap,OS_IsValidIP -Wl,--wrap,_mwarn")
 
 LIST(APPEND analysisd_names "test_eventinfo_list")
 LIST(APPEND analysisd_flags "-Wl,--wrap,Free_Eventinfo")
@@ -182,10 +184,25 @@ list(APPEND analysisd_flags "-Wl,--wrap,asys_create_state_json -Wl,--wrap,OS_Bin
                              -Wl,--wrap,OS_RecvSecureTCP -Wl,--wrap,OS_SendSecureTCP -Wl,--wrap,getGlobalConfig -Wl,--wrap,asys_create_agents_state_json \
                              -Wl,--wrap,wdb_get_agents_ids_of_current_node -Wl,--wrap,json_parse_agents -Wl,--wrap,getpid ${DEBUG_OP_WRAPPERS}")
 
+LIST(APPEND analysisd_names "test_system_memory")
+LIST(APPEND analysisd_flags " ")
+
+LIST(APPEND analysisd_names "test_rules_read")
+LIST(APPEND analysisd_flags "-Wl,--wrap,_os_analysisd_add_logmsg -Wl,--wrap,getDefine_Int")
+
 LIST(APPEND analysisd_names "test_limits")
 LIST(APPEND analysisd_flags "-Wl,--wrap,_minfo -Wl,--wrap,_mwarn")
 
 list(APPEND analysisd_names "test_json_extended")
+list(APPEND analysisd_flags "${DEBUG_OP_WRAPPERS}")
+
+list(APPEND analysisd_names "test_json_decoder")
+list(APPEND analysisd_flags "-Wl,--wrap,strdup -Wl,--wrap,free")
+
+list(APPEND analysisd_names "test_analysisd_upgrade_module")
+list(APPEND analysisd_flags "-Wl,--wrap,OS_ConnectUnixDomain -Wl,--wrap,OS_SendSecureTCP ${DEBUG_OP_WRAPPERS}")
+
+list(APPEND analysisd_names "test_analysisd_dodiff")
 list(APPEND analysisd_flags "${DEBUG_OP_WRAPPERS}")
 
 list(LENGTH analysisd_names count)

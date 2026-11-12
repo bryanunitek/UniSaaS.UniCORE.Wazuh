@@ -11,23 +11,29 @@ import base64
 import jwt
 import asyncio
 
+from typing import Optional
+
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.middleware.cors import CORSMiddleware
 
+from connexion import AsyncApp
 from connexion.exceptions import OAuthProblem
 from connexion.lifecycle import ConnexionRequest
+from connexion.middleware import MiddlewarePosition
 from connexion.security import AbstractSecurityHandler
+
+from content_size_limit_asgi import ContentSizeLimitMiddleware
 
 from secure import Secure, ContentSecurityPolicy, XFrameOptions, Server
 
 from wazuh.core.utils import get_utc_now
 
 from api import configuration
-from api.alogging import custom_logging
+from api.alogging import MAX_LOGGED_BODY_SIZE, control_chars_pattern, custom_logging, escape_control_chars
 from api.authentication import generate_keypair, JWT_ALGORITHM
-from api.api_exception import BlockedIPException, MaxRequestsException, ExpectFailedException
-from api.controllers.util import build_recursion_error_response
+from api.api_exception import BlockedIPException, ExpectFailedException, MaxRequestsException, PayloadTooLargeException
 
 # Default of the max event requests allowed per minute
 MAX_REQUESTS_EVENTS_DEFAULT = 30
@@ -41,6 +47,18 @@ LOGIN_ENDPOINT = '/security/user/authenticate'
 
 # Authentication context hash key
 HASH_AUTH_CONTEXT_KEY = 'hash_auth_context'
+
+# Default of the max auth_context payload size in bytes (see api.yaml `auth_context_max_payload_size`).
+# Literal on purpose: `read_yaml_config()` merges the installed api.yaml into `default_api_configuration`
+# in place, so that dict stops holding the default as soon as the option is set.
+AUTH_CONTEXT_MAX_PAYLOAD_SIZE = 64 * 1024
+
+# Written to the access log in place of the run_as authorization context below debug level
+AUTH_CONTEXT_NOT_LOGGED = '<authorization context not logged; see hash_auth_context>'
+
+# Scope extensions key under which a middleware leaves a body it has already read, for the layers
+# above it -- which never see the stream -- to report
+CACHED_BODY_KEY = 'wazuh_cached_body'
 
 # API secure headers
 server = Server().set("Wazuh")
@@ -60,6 +78,116 @@ events_request_counter = 0
 events_current_time = None
 
 
+def get_declared_content_length(request: Request) -> Optional[int]:
+    """Get the body size the request declares in its `Content-Length` header.
+
+    The header is readable before a single byte of the body is consumed, and the ASGI server never
+    delivers more body than the request declares, so it is a sound upper bound on what reading the
+    body would cost. Requests that declare no length at all, i.e. chunked transfer encoding, have to
+    be capped while they are read instead.
+
+    Parameters
+    ----------
+    request : Request
+        HTTP request.
+
+    Returns
+    -------
+    Optional[int]
+        Declared body length, or None when the header is absent, malformed or negative.
+    """
+    try:
+        declared_length = int(request.headers.get('content-length'))
+    except (TypeError, ValueError):
+        return None
+
+    # A negative length is not a length at all: treating it as unknown sends the request down the
+    # capped-read path instead of letting it slip past an upper-bound comparison it cannot fail.
+    return declared_length if declared_length >= 0 else None
+
+
+async def read_capped_body(request: Request, limit: int, detail: str) -> bytes:
+    """Read the request body, abandoning the stream as soon as `limit` bytes are exceeded.
+
+    `Request.body()` materialises the whole payload and leaves the caller to measure it afterwards,
+    so an oversized body has already been paid for by the time it is refused. This pulls the stream
+    chunk by chunk and stops reading from the socket at the limit instead.
+
+    A body that fits is cached in the request the same way `Request.body()` caches it, so it is
+    still replayed to the middleware stack below. That cache is per `Request` object and travels
+    downwards only, so a caller that also needs the bytes read here to be visible to an outer
+    middleware has to publish them with `set_cached_body`.
+
+    Parameters
+    ----------
+    request : Request
+        HTTP request.
+    limit : int
+        Maximum body size allowed, in bytes.
+    detail : str
+        Detail reported in the exception when the body is too large.
+
+    Returns
+    -------
+    bytes
+        Request body.
+
+    Raises
+    ------
+    PayloadTooLargeException
+        If the body exceeds `limit` bytes.
+    """
+    if not hasattr(request, '_body'):
+        chunks = []
+        read = 0
+        async for chunk in request.stream():
+            read += len(chunk)
+            if read > limit:
+                raise PayloadTooLargeException(title="Request Entity Too Large", detail=detail)
+            chunks.append(chunk)
+        request._body = b''.join(chunks)
+
+    if len(request._body) > limit:
+        raise PayloadTooLargeException(title="Request Entity Too Large", detail=detail)
+
+    return request._body
+
+
+def set_cached_body(request: Request, body: bytes):
+    """Publish a body already read for this request to the middlewares above.
+
+    Every `BaseHTTPMiddleware` layer builds its own `Request`, and the body one of them caches is
+    replayed downwards but is invisible upwards: the outer layer holds a different object, and by
+    the time it runs again the stream is gone. The ASGI scope is the one thing both layers share,
+    so the bytes travel up through the `extensions` dict the access logger creates before
+    dispatching -- the same channel that carries the authenticated identity back out.
+
+    Parameters
+    ----------
+    request : Request
+        HTTP request.
+    body : bytes
+        Body already read for this request.
+    """
+    request.scope.setdefault('extensions', {})[CACHED_BODY_KEY] = body
+
+
+def get_cached_body(request: Request) -> Optional[bytes]:
+    """Get the body an inner middleware published for this request.
+
+    Parameters
+    ----------
+    request : Request
+        HTTP request.
+
+    Returns
+    -------
+    Optional[bytes]
+        Body read below, or None when no layer published one and the stream was left to the endpoint.
+    """
+    return request.scope.get('extensions', {}).get(CACHED_BODY_KEY)
+
+
 async def access_log(request: ConnexionRequest, response: Response, prev_time: time):
     """Generate Log message from the request."""
 
@@ -71,18 +199,41 @@ async def access_log(request: ConnexionRequest, response: Response, prev_time: t
     host = request.client.host if hasattr(request, 'client') else ''
     method = request.method if hasattr(request, 'method') else ''
     query = dict(request.query_params) if hasattr(request, 'query_params') else {}
-    # If the request content is valid, the _json attribute is set when the
-    # first time the json function is awaited. This check avoids raising an
-    # exception when the request json content is invalid.
-    body = await request.json() if hasattr(request, '_json') else {}
     hash_auth_context = context.get('token_info', {}).get(HASH_AUTH_CONTEXT_KEY, '')
+
+    # Only a caller the security handler accepted gets its payload recorded. connexion writes the
+    # identity into the request context once, and only once, authentication has succeeded, so its
+    # presence is the answer -- not the response status, which cannot distinguish a rejection issued
+    # above the security handler from the same code returned to an authenticated caller further
+    # down. `WazuhAccessLoggerMiddleware` is what makes the context readable from out here.
+    log_body = bool(context.get('user', None) or context.get('token_info', None))
+
+    # The body is deserialised here, after the response, and no longer in the middleware before the
+    # request was dispatched: nothing should build an object graph out of a payload for a caller
+    # nobody has authenticated yet. It is parsed only where the result is used -- written to the
+    # logs, or hashed into a run_as auth context identifier -- and only from bytes the middleware
+    # already cached, never by reading the stream again. This runs after the response has been
+    # produced, so a payload that will not parse degrades to an empty body rather than turning a
+    # served response into a 500.
+    body_read = hasattr(request, '_body')
+    body = {}
+    if body_read and (log_body or path == RUN_AS_LOGIN_ENDPOINT):
+        try:
+            body = await request.json()
+        except RecursionError:
+            body = {}
 
     if 'password' in query:
         query['password'] = '****'
-    if 'password' in body:
-        body['password'] = '****'
-    if 'key' in body and '/agents' in path:
-        body['key'] = '****'
+    # `body` is whatever `request.json()` returned, which is None for a malformed, null or binary
+    # payload and a non-dict for a JSON list or scalar. Only a mapping can carry these fields, and
+    # only a mapping supports the assignment; guard so a small unparsable body from an authenticated
+    # caller degrades to an unmasked log line rather than a 500 raised after the response was sent.
+    if isinstance(body, dict):
+        if 'password' in body:
+            body['password'] = '****'
+        if 'key' in body and '/agents' in path:
+            body['key'] = '****'
 
     # Get the username from the request. If it is not found in the context, try
     # to get it from the headers using basic or bearer authentication methods.
@@ -102,20 +253,32 @@ async def access_log(request: ConnexionRequest, response: Response, prev_time: t
         except (KeyError, IndexError, binascii.Error, jwt.exceptions.PyJWTError, OAuthProblem):
             user = UNKNOWN_USER_STRING
 
-    # Sanitize username to escape control characters
-    if user and user != UNKNOWN_USER_STRING:
-        # Check if username contains control characters and log a warning
-        if any(c in user for c in ['\n', '\r', '\t']):
-            logger.warning(
-                f'Username contains control characters. User: {user!r}, IP: {host}, '
-                f'Path: {path}.'
-            )
-        user = user.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+    # custom_logging() escapes every field it writes; this only flags the attempt.
+    if user and user != UNKNOWN_USER_STRING and control_chars_pattern.search(user):
+        logger.warning(
+            f'Username contains control characters. User: {user!r}, IP: {host}, '
+            f'Path: {escape_control_chars(path)}.'
+        )
 
-    # Create hash if run_as login
-    if not hash_auth_context and path == RUN_AS_LOGIN_ENDPOINT:
+    # Create hash if run_as login. Only from an auth context that was actually read: hashing the
+    # empty body that stands in for a payload no layer cached would stamp every such attempt with
+    # the same constant, valid-looking digest instead of leaving the field empty.
+    if not hash_auth_context and path == RUN_AS_LOGIN_ENDPOINT and body_read:
         hash_auth_context = hashlib.blake2b(json.dumps(body).encode(),
                                             digest_size=16).hexdigest()
+
+    # The auth context hash computed above is kept even when the body is not logged: it is a
+    # fixed-size digest, and it is precisely the useful field for a run_as attempt that failed.
+    if not log_body:
+        body = {}
+    # The authorization context carries third-party identity (AD/LDAP group memberships, SSO claims)
+    # and is written verbatim to api.log and again to api.json. The hash above already identifies it,
+    # so the payload itself is only logged when debug is explicitly enabled -- `isEnabledFor` rather
+    # than `logger.level`, so an unconfigured logger masks instead of falling through. Hashed before
+    # the substitution, so the digest still matches the one api/api/authentication.py stamps into the
+    # issued token.
+    elif path == RUN_AS_LOGIN_ENDPOINT and not logger.isEnabledFor(logging.DEBUG):
+        body = {'auth_context': AUTH_CONTEXT_NOT_LOGGED}
 
     custom_logging(user, host, method, path, query, body, time_diff, response.status_code,
                    hash_auth_context=hash_auth_context, headers=headers)
@@ -126,7 +289,11 @@ async def access_log(request: ConnexionRequest, response: Response, prev_time: t
 
 
 async def check_blocked_ip(request: Request):
-    """Blocks/unblocks the IPs that are requesting an API token.
+    """Blocks/unblocks the IPs that are requesting an API token, counting the attempt.
+
+    The attempt is counted in the same locked section that checks the block, before the
+    request is dispatched to authentication, so concurrent requests observe each other's
+    in-flight attempts instead of only already-recorded failures.
 
     Parameters
     ----------
@@ -139,6 +306,7 @@ async def check_blocked_ip(request: Request):
     global ip_block, ip_stats
     access_conf = configuration.api_conf['access']
     block_time = access_conf['block_time']
+    max_login_attempts = access_conf['max_login_attempts']
     host = request.client.host
 
     async with ip_lock:
@@ -156,6 +324,45 @@ async def check_blocked_ip(request: Request):
                 detail="Limit of login attempts reached. The current IP has been blocked due "
                        "to a high number of login attempts"
             )
+
+        # The timestamp is only set when the entry is created so `block_time` counts from the first attempt.
+        if host not in ip_stats:
+            ip_stats[host] = {'attempts': 1, 'timestamp': get_utc_now().timestamp()}
+        else:
+            ip_stats[host]['attempts'] += 1
+
+        if ip_stats[host]['attempts'] >= max_login_attempts:
+            ip_block.add(host)
+
+
+async def settle_login_attempt(request: Request):
+    """Release the attempt reserved by `check_blocked_ip` for a successful login.
+
+    Only failed login attempts should count towards `max_login_attempts`, so a
+    successful authentication releases the attempt that was counted at the gate
+    before credential validation ran.
+
+    Parameters
+    ----------
+    request : Request
+        HTTP request.
+    """
+    global ip_block, ip_stats
+    max_login_attempts = configuration.api_conf['access']['max_login_attempts']
+    host = request.client.host
+
+    async with ip_lock:
+        if host not in ip_stats:
+            return
+
+        attempts = ip_stats[host]['attempts'] - 1
+        # An entry with no outstanding attempts is dropped so the next window starts at the next attempt.
+        if attempts > 0:
+            ip_stats[host]['attempts'] = attempts
+        else:
+            del ip_stats[host]
+        if attempts < max_login_attempts:
+            ip_block.discard(host)
 
 
 def check_rate_limit(
@@ -227,6 +434,49 @@ class CheckRateLimitsMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
 
+class CheckAuthContextSizeMiddleware(BaseHTTPMiddleware):
+    """Reject run_as requests whose body exceeds auth_context_max_payload_size.
+
+    The option governs the access logger's caching threshold on this path too
+    (`WazuhAccessLoggerMiddleware`): a body this class admits but that layer does not cache reaches
+    `access_log` with nothing to hash, and the attempt is logged without its auth context hash.
+    """
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        """Refuse an oversized auth context without paying for it first.
+
+        The declared `Content-Length` is checked before the body is touched, so a payload a
+        thousand times the endpoint's limit is refused at the header. A request that declares no
+        length is read with a cap and abandoned at the limit, rather than materialised in full and
+        measured afterwards.
+
+        Parameters
+        ----------
+        request : Request
+            HTTP Request received.
+        call_next :  RequestResponseEndpoint
+            Endpoint callable to be executed.
+
+        Returns
+        -------
+        Response
+            Returned response.
+        """
+        if request.url.path == RUN_AS_LOGIN_ENDPOINT and request.method == "POST":
+            max_size = configuration.api_conf['auth_context_max_payload_size']
+            detail = f"Auth context payload exceeds the maximum allowed size of " \
+                     f"{max_size} bytes."
+            declared_length = get_declared_content_length(request)
+            if declared_length is None:
+                # This is the only layer that reads a chunked auth context, and the access logger
+                # above it will never see the stream, so the bytes are handed over explicitly.
+                # Without this, a chunked run_as attempt is logged with an empty body.
+                set_cached_body(request, await read_capped_body(request, max_size, detail))
+            elif declared_length > max_size:
+                raise PayloadTooLargeException(title="Request Entity Too Large", detail=detail)
+        return await call_next(request)
+
+
 class CheckBlockedIP(BaseHTTPMiddleware):
     """Rate Limits Middleware."""
 
@@ -258,21 +508,47 @@ class WazuhAccessLoggerMiddleware(BaseHTTPMiddleware):
         """
         prev_time = time.time()
 
-        body = await request.body()
-        if body:
-            try:
-                # Load the request body to the _json field before calling the controller so it's cached before the stream 
-                # is consumed. If there's a json error we skip it so it's handled later.
-                # Related to https://github.com/wazuh/wazuh/issues/24060.
-                _ = await request.json()
-            except json.decoder.JSONDecodeError:
-                pass
-            except RecursionError:
-                conn_resp = build_recursion_error_response(pretty=False)
-                return Response(content=conn_resp.body, status_code=conn_resp.status_code,
-                            media_type=conn_resp.content_type)
+        # connexion's routing middleware passes a shallow copy of the scope downwards, so the
+        # request context that the security handler writes into the copy's `extensions` is invisible
+        # from out here -- which is why the username below has to be recovered from the authorization
+        # header. Creating `extensions` before the request is dispatched makes the copy share this
+        # very dict, so `access_log` can read the identity the security handler settled on and does
+        # not have to guess it from the response status.
+        request.scope.setdefault('extensions', {})
+
+        # This is the outermost middleware, so reading every body here handed an unauthenticated
+        # caller a max_upload_size buffer plus the object graph deserialised from it, once per
+        # request, before the security handler had been asked who was calling.
+        #
+        # Only the bytes are buffered, and only when they are small enough to be worth logging.
+        # `access_log` runs after the response, when the stream is gone, so they have to be cached
+        # here for it to report them; the deserialisation is deferred to `access_log`, which by then
+        # knows whether the result is needed at all. Reading is bounded by the declared length, since
+        # the ASGI server never delivers more body than the request declares; a request that declares
+        # none, or declares more than is worth logging, is left for the endpoint to read and its body
+        # does not reach the log.
+        #
+        # The run_as login path is bounded by `auth_context_max_payload_size` rather than by the
+        # logging limit: `CheckAuthContextSizeMiddleware` admits an auth context up to that size, and
+        # a body that reaches no cache is hashed by nothing, so the attempt would be logged without
+        # its auth context hash. Anything above it is refused below, and custom_logging() still omits
+        # a payload larger than MAX_LOGGED_BODY_SIZE from the log line.
+        max_cached_body = (configuration.api_conf['auth_context_max_payload_size']
+                           if request.url.path == RUN_AS_LOGIN_ENDPOINT else MAX_LOGGED_BODY_SIZE)
+        content_length = get_declared_content_length(request)
+        if content_length is not None and 0 < content_length <= max_cached_body:
+            # Related to https://github.com/wazuh/wazuh/issues/24060.
+            await request.body()
 
         response = await call_next(request)
+
+        # A chunked run_as auth context is read by `CheckAuthContextSizeMiddleware`, which caps it
+        # while reading because there is no length to check. That happens below this layer, and a
+        # body cached in one `BaseHTTPMiddleware` request travels downwards only, so adopt the
+        # bytes it published; otherwise the attempt is logged, and hashed, as an empty body.
+        if not hasattr(request, '_body') and (cached_body := get_cached_body(request)) is not None:
+            request._body = cached_body
+
         await access_log(ConnexionRequest.from_starlette_request(request), response, prev_time)
         return response
 
@@ -303,36 +579,110 @@ class CheckExpectHeaderMiddleware(BaseHTTPMiddleware):
     """Middleware to check for the 'Expect' header in incoming requests."""
 
     async def dispatch(self, request: ConnexionRequest, call_next: RequestResponseEndpoint) -> Response:
-        """Check for specific request headers and generate error 417 if conditions are not met.
-                
+        """Refuse an expectation this API cannot meet, before the body behind it is read.
+
+        An expectation other than `100-continue` is refused with 417, the status RFC 9110 reserves
+        for one the server will not meet. A `100-continue` whose declared length is already above
+        `max_upload_size` is refused with 413 instead: the expectation itself is understood, it is
+        the body it announces that is too large, and 413 is the status every other size ceiling in
+        this API answers with.
+
         Parameters
         ----------
             request : Request
             HTTP Request received.
         call_next :  RequestResponseEndpoint
             Endpoint callable to be executed.
-        
+
         Returns
         -------
             Returned response.
+
+        Raises
+        ------
+        ExpectFailedException
+            If the request expects something other than `100-continue`.
+        PayloadTooLargeException
+            If the request declares a body above `max_upload_size`.
         """
-        
+
         if 'Expect' not in request.headers:
             response = await call_next(request)
             return response
         else:
             expect_value = request.headers["Expect"].lower()
-            
+
             if expect_value != '100-continue':
                 raise ExpectFailedException(status=417, title="Expectation failed", detail="Unknown Expect")
-            
+
             if 'Content-Length' in request.headers:
                 content_length = int(request.headers["Content-Length"])
                 max_upload_size = configuration.api_conf["max_upload_size"]
-                if content_length > max_upload_size:
-                    raise ExpectFailedException(status=417, title="Expectation failed",
-                                                detail=f"Maximum content size limit ({max_upload_size}) exceeded "
-                                                       f"({content_length} bytes read)")
-                
+                if max_upload_size and content_length > max_upload_size:
+                    logger.warning(
+                        "Rejected a request to %s: Maximum content size limit (%s) exceeded (%s bytes declared)",
+                        request.scope.get('path', ''), max_upload_size, content_length)
+                    raise PayloadTooLargeException(
+                        title="Request Entity Too Large",
+                        detail=f"Maximum content size limit ({max_upload_size}) exceeded "
+                               f"({content_length} bytes declared)")
+
         response = await call_next(request)
         return response
+
+
+def setup_middlewares(app: AsyncApp):
+    """Register every API middleware on `app`, in the only order that keeps the size ceiling a 413.
+
+    `ContentSizeLimitMiddleware` enforces `max_upload_size` by wrapping the ASGI receive channel and
+    raising `ContentSizeExceeded` from inside the receive call that crosses the limit. That exception
+    has to reach connexion's exception middleware to become a 413, and a `BaseHTTPMiddleware` runs
+    everything below it inside its own anyio task group: an exception crossing that boundary arrives
+    wrapped in an `ExceptionGroup` the exception middleware does not handle, and `ServerErrorMiddleware`
+    renders it as a 500. A `BaseHTTPMiddleware` registered *above* the ceiling is harmless; one *below*
+    it turns every oversized body into a 500.
+
+    connexion inserts a middleware immediately before the class named by its position, so two
+    registered at the same position stack in registration order, the later one landing below the
+    earlier. Registering the ceiling last is therefore what keeps every `BaseHTTPMiddleware` above it,
+    and `BEFORE_VALIDATION` is what keeps it above `RequestValidationMiddleware`, the layer that reads
+    the body of every endpoint that declares a JSON schema.
+
+    A middleware added after this function, or at a position below `BEFORE_VALIDATION`, silently takes
+    the ceiling back to answering 500. Add it inside this function instead, before the ceiling.
+
+    Parameters
+    ----------
+    app : AsyncApp
+        Connexion application to register the middlewares on.
+    """
+    api_conf = configuration.api_conf
+
+    if api_conf['access']['max_request_per_minute'] > 0:
+        app.add_middleware(CheckRateLimitsMiddleware, MiddlewarePosition.BEFORE_SECURITY)
+    # Judged before request validation reads the body, and above the ceiling. Its default position,
+    # BEFORE_CONTEXT, left it below every reader of the body, where it swallowed the ceiling's
+    # ContentSizeExceeded for the endpoints request validation does not read -- the XML and
+    # octet-stream configuration uploads, the very requests max_upload_size exists to bound.
+    app.add_middleware(CheckExpectHeaderMiddleware, MiddlewarePosition.BEFORE_VALIDATION)
+    app.add_middleware(CheckBlockedIP, MiddlewarePosition.BEFORE_SECURITY)
+    app.add_middleware(CheckAuthContextSizeMiddleware, MiddlewarePosition.BEFORE_SECURITY)
+    app.add_middleware(WazuhAccessLoggerMiddleware, MiddlewarePosition.BEFORE_EXCEPTION)
+    app.add_middleware(SecureHeadersMiddleware, MiddlewarePosition.BEFORE_EXCEPTION)
+
+    # Enable CORS
+    if api_conf['cors']['enabled']:
+        app.add_middleware(
+            CORSMiddleware,
+            position=MiddlewarePosition.BEFORE_EXCEPTION,
+            allow_origins=api_conf['cors']['source_route'],
+            expose_headers=api_conf['cors']['expose_headers'],
+            allow_headers=api_conf['cors']['allow_headers'],
+            allow_credentials=api_conf['cors']['allow_credentials'],
+        )
+
+    # Maximum body size that the API accepts, in bytes (0 disables the ceiling). This must stay the
+    # last middleware registered -- see this function's docstring.
+    if api_conf['max_upload_size']:
+        app.add_middleware(ContentSizeLimitMiddleware, MiddlewarePosition.BEFORE_VALIDATION,
+                           max_content_size=api_conf['max_upload_size'])

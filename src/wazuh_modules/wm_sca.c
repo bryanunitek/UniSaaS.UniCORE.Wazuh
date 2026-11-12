@@ -101,6 +101,7 @@ static int wm_sca_check_dir_list(wm_sca_t * const data, char * const dir_list, c
 static int wm_sca_check_process_is_running(OSList *p_list, char * value, char ** reason, w_expression_t * regex_engine);
 #ifndef WIN32
 static int wm_sca_resolve_symlink(const char * const file, char * realpath_buffer, char **reason);
+static FILE * wm_sca_open_regular_file(const char * const path, bool * const not_regular);
 #endif
 static int wm_sca_apply_numeric_partial_comparison(const char * const partial_comparison, const long int number, char **reason, w_expression_t * regex_engine);
 static int wm_sca_regex_numeric_comparison (const char * const pattern, const char *const str, char ** reason, w_expression_t * regex_engine);
@@ -962,6 +963,7 @@ static int wm_sca_do_scan(cJSON * checks,
 
     int ret_val = 0;
     OSList *p_list = NULL;
+    bool remote_commands_warned = false;
 
     /* Initialize variables */
     memset(buf, '\0', sizeof(buf));
@@ -1155,13 +1157,15 @@ static int wm_sca_do_scan(cJSON * checks,
                 os_strdup(value, rule_location);
 
                 if (!data->remote_commands && remote_policy) {
-                    mwarn("Ignoring check for policy '%s'. The internal option 'sca.remote_commands' is disabled.", cJSON_GetObjectItem(policy, "name")->valuestring);
+                    if (!remote_commands_warned) {
+                        mwarn("Ignoring check for policy '%s'. The internal option 'sca.remote_commands' is disabled.", cJSON_GetObjectItem(policy, "name")->valuestring);
+                        remote_commands_warned = true;
+                    }
                     if (reason == NULL) {
                         os_malloc(snprintf(NULL, 0, "Ignoring check for running command '%s'. The internal option 'sca.remote_commands' is disabled", rule_location) + 1, reason);
                         sprintf(reason, "Ignoring check for running command '%s'. The internal option 'sca.remote_commands' is disabled", rule_location);
                     }
                     found = RETURN_INVALID;
-
                 } else {
                     /* If any, replace the variables by their respective values */
                     if (sorted_variables) {
@@ -1524,6 +1528,58 @@ static int wm_sca_check_file_existence(const char * const file, char **reason)
     return RETURN_INVALID;
 }
 
+#ifndef WIN32
+/**
+ * @brief Open a file for reading only if it is a regular file.
+ *
+ * The file type is checked on the opened descriptor rather than on the path, so the entry cannot be
+ * replaced by a FIFO or a device between the check and the read. O_NONBLOCK keeps the open itself from
+ * waiting on a FIFO writer; it is cleared once the descriptor is known to be a regular file.
+ *
+ * @param path File to open. Symbolic links are followed.
+ * @param not_regular Set to true when the file exists but is not a regular file.
+ * @return The opened stream, or NULL on error (errno is set unless *not_regular is true).
+ */
+static FILE * wm_sca_open_regular_file(const char * const path, bool * const not_regular)
+{
+    struct stat statbuf;
+    FILE *fp = NULL;
+    int flags;
+    int saved_errno;
+
+    *not_regular = false;
+
+    const int fd = open(path, O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
+    if (fd < 0) {
+        return NULL;
+    }
+
+    if (fstat(fd, &statbuf) < 0) {
+        saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return NULL;
+    }
+
+    if (!S_ISREG(statbuf.st_mode)) {
+        *not_regular = true;
+        close(fd);
+        return NULL;
+    }
+
+    if (flags = fcntl(fd, F_GETFL), flags == -1
+        || fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) == -1
+        || (fp = fdopen(fd, "r")) == NULL) {
+        saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return NULL;
+    }
+
+    return fp;
+}
+#endif
+
 static int wm_sca_check_file_contents(const char * const file,
                                       const char * const pattern,
                                       char ** reason,
@@ -1533,6 +1589,8 @@ static int wm_sca_check_file_contents(const char * const file,
 
     #ifdef WIN32
     const char *realpath_buffer = file;
+    FILE *fp = wfopen(realpath_buffer, "r");
+    const int fopen_errno = errno;
     #else
     char realpath_buffer[OS_MAXSTR];
     const int wm_sca_resolve_symlink_result = wm_sca_resolve_symlink(file, realpath_buffer, reason);
@@ -1546,10 +1604,20 @@ static int wm_sca_check_file_contents(const char * const file,
 
         return RETURN_INVALID;
     }
+
+    bool not_regular = false;
+    FILE *fp = wm_sca_open_regular_file(realpath_buffer, &not_regular);
+    const int fopen_errno = errno;
+    if (not_regular) {
+        if (*reason == NULL) {
+            os_malloc(snprintf(NULL, 0, "Could not open file '%s': Not a regular file", file) + 1, *reason);
+            sprintf(*reason, "Could not open file '%s': Not a regular file", file);
+        }
+        mdebug2("Could not open file '%s': Not a regular file", file);
+        return RETURN_INVALID;
+    }
     #endif
 
-    FILE *fp = wfopen(realpath_buffer, "r");
-    const int fopen_errno = errno;
     if (!fp) {
         if (*reason == NULL) {
             os_malloc(snprintf(NULL, 0, "Could not open file '%s': %s", file, strerror(fopen_errno)) + 1, *reason);

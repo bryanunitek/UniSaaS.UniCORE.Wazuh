@@ -8,6 +8,7 @@
  * License (version 2) as published by the FSF - Free Software
  * Foundation.
  */
+#include <algorithm>
 #include <fstream>
 #include <iostream>
 #include <regex>
@@ -31,6 +32,9 @@
 #include "linuxInfoHelper.h"
 #include "groups_linux.hpp"
 #include "user_groups_linux.hpp"
+#include "auth_failures_linux.hpp"
+#include "last_login_linux.hpp"
+#include "last_login_resolution.hpp"
 #include "logged_in_users_linux.hpp"
 #include "shadow_linux.hpp"
 #include "sudoers_unix.hpp"
@@ -93,7 +97,6 @@ static nlohmann::json getProcessInfo(const SysInfoProcess& process)
     nlohmann::json jsProcessInfo{};
     // Current process information
     jsProcessInfo["pid"]        = std::to_string(process->tid);
-    jsProcessInfo["name"]       = process->cmd;
     jsProcessInfo["state"]      = &process->state;
     jsProcessInfo["ppid"]       = process->ppid;
     jsProcessInfo["utime"]      = process->utime;
@@ -121,6 +124,9 @@ static nlohmann::json getProcessInfo(const SysInfoProcess& process)
         }
     }
 
+    // comm is capped at TASK_COMM_LEN; fall back to it whenever cmdline can't give a name.
+    const std::string baseName{commandLine.empty() ? std::string{} : std::filesystem::path(commandLine).filename().string()};
+    jsProcessInfo["name"] = baseName.empty() ? process->cmd : baseName;
     jsProcessInfo["cmd"]        = commandLine;
     jsProcessInfo["argvs"]      = commandLineArgs;
     jsProcessInfo["euser"]      = process->euser;
@@ -541,7 +547,8 @@ nlohmann::json SysInfo::getPorts() const
                     row = Utils::trim(row);
                     Utils::replaceAll(row, "\t", " ");
                     row = Utils::trimRepeated(row, ' ');
-                    std::make_unique<PortImpl>(std::make_shared<LinuxPortWrapper>(portType.first, row))->buildPortData(port);
+                    const LinuxPortWrapper wrapper(portType.first, row);
+                    PortImpl(wrapper).buildPortData(port);
                     inodes.push_back(port.at("inode"));
                     ports.push_back(std::move(port));
                 }
@@ -687,7 +694,43 @@ nlohmann::json SysInfo::getUsers() const
     ShadowProvider shadowProvide;
     auto collectedShadow = shadowProvide.collect();
 
+    // The rules do not depend on the user, and re-reading /etc/sudoers and its includes per
+    // account is expensive.
+    SudoersProvider sudoersProvider;
+    auto collectedSudoers = sudoersProvider.collect();
+
+    // The User_Alias map does not depend on the user either, so build it once for the whole scan
+    // instead of re-parsing it inside isUserSudoer() for every account.
+    auto sudoersUserAliases = SudoersProvider::collectUserAliases(collectedSudoers);
+
     UserGroupsProvider userGroupsProvider;
+
+    // Resolve group membership for every user in a single call. Asking per user repeated
+    // the underlying passwd and group lookups once per user and left no opportunity to
+    // share work between them, which on a host whose accounts come from a network
+    // directory meant one round trip per (user, group) pair.
+    std::set<uid_t> allUids;
+
+    for (const auto& user : collectedUsers)
+    {
+        allUids.insert(static_cast<uid_t>(user["uid"].get<int>()));
+    }
+
+    // An empty set means "every uid" to getGroupNamesByUid(), so only ask when there is
+    // actually something to ask about.
+    const auto groupsByUid = allUids.empty()
+                             ? nlohmann::json::object()
+                             : userGroupsProvider.getGroupNamesByUid(allUids);
+
+    // The last login is the newest of lastlog, lastlog2 and the sessions open now. It is known for
+    // every account before the loop because the failed attempts are counted since that login. The
+    // rules, and the order they have to be applied in, live in resolveLastLogins().
+    LastLoginProvider lastLoginProvider;
+    const auto lastLogins = resolveLastLogins(collectedUsers, collectedLoggedInUser, lastLoginProvider);
+    auto lastLoginByName = lastLogins.byName;
+
+    AuthFailuresProvider authFailuresProvider;
+    authFailuresProvider.load(lastLoginByName, lastLogins.known);
 
     for (auto& user : collectedUsers)
     {
@@ -698,15 +741,37 @@ nlohmann::json SysInfo::getUsers() const
         userItem["user_id"] = user["uid"];
         userItem["user_full_name"] = user["description"];
         userItem["user_home"] = user["directory"];
-        userItem["user_is_remote"] = user["include_remote"];
+        userItem["user_is_remote"] = user["is_remote"];
         userItem["user_name"] = username;
         userItem["user_shell"] = user["shell"];
         userItem["user_uid_signed"] = user["uid_signed"];
         userItem["user_group_id_signed"] = user["gid_signed"];
         userItem["user_group_id"] = user["gid"];
 
-        std::set<uid_t> uid {static_cast<uid_t>(user["uid"].get<int>())};
-        auto collectedUsersGroups = userGroupsProvider.getGroupNamesByUid(uid);
+        // getGroupNamesByUid() returns a bare array when asked about a single uid and an
+        // object keyed by uid otherwise, so both shapes have to be handled: a host with
+        // exactly one user yields the array form.
+        nlohmann::json collectedUsersGroups = nlohmann::json::array();
+
+        if (groupsByUid.is_object())
+        {
+            // Keyed exactly as getGroupNamesByUid() built it, from uid_t. Formatting the
+            // narrowed int instead would look up "-2" for uid 4294967294 and find nothing.
+            const auto uid = static_cast<uid_t>(user["uid"].get<int>());
+            const auto entry = groupsByUid.find(std::to_string(uid));
+
+            if (entry != groupsByUid.end())
+            {
+                collectedUsersGroups = *entry;
+            }
+        }
+        else if (groupsByUid.is_array())
+        {
+            collectedUsersGroups = groupsByUid;
+        }
+
+        // The sudoers lookup needs the group names one by one, not concatenated.
+        std::set<std::string> userGroupNames;
 
         if (collectedUsersGroups.empty())
         {
@@ -723,7 +788,9 @@ nlohmann::json SysInfo::getUsers() const
                     accumGroups += secondaryArraySeparator;
                 }
 
-                accumGroups += group.get<std::string>();
+                const auto groupName = group.get<std::string>();
+                accumGroups += groupName;
+                userGroupNames.insert(groupName);
             }
 
             userItem["user_groups"] = accumGroups;
@@ -738,8 +805,14 @@ nlohmann::json SysInfo::getUsers() const
         // Macos
         userItem["user_is_hidden"] = 0;
         userItem["user_created"] = 0;
-        userItem["user_auth_failed_count"] = 0;
-        userItem["user_auth_failed_timestamp"] = 0;
+
+        // Without a source the count is -1, which the inventory harvester drops, and the timestamp is 0.
+        const auto authFailures = authFailuresProvider.get(username);
+        userItem["user_auth_failed_count"] = authFailures.known ? static_cast<int64_t>(authFailures.count) : -1;
+        userItem["user_auth_failed_timestamp"] = authFailures.known ? static_cast<double>(authFailures.latest) : 0.0;
+
+        const auto lastLoginEntry = lastLoginByName.find(username);
+        userItem["user_last_login"] = lastLoginEntry != lastLoginByName.end() ? lastLoginEntry->second : 0;
 
         auto matched = false;
         auto lastLogin = 0;
@@ -749,9 +822,6 @@ nlohmann::json SysInfo::getUsers() const
         //TODO: Avoid this iteration, move logic to LoggedInUsersProvider
         for (auto& item : collectedLoggedInUser)
         {
-            // By default, user is not logged in.
-            userItem["login_status"] = 0;
-
             // tty,host,time and pid can take more than one value due to different logins.
             if (item["user"] == username)
             {
@@ -763,7 +833,6 @@ nlohmann::json SysInfo::getUsers() const
                 if (newDate > lastLogin)
                 {
                     lastLogin = newDate;
-                    userItem["user_last_login"] = newDate;
                     userItem["login_tty"] = item["tty"].get<std::string>();
                     userItem["login_type"] = item["type"].get<std::string>();
                     userItem["process_pid"] = item["pid"].get<int32_t>();
@@ -786,7 +855,6 @@ nlohmann::json SysInfo::getUsers() const
             userItem["login_tty"] = UNKNOWN_VALUE;
             userItem["login_type"] = UNKNOWN_VALUE;
             userItem["process_pid"] = 0;
-            userItem["user_last_login"] = 0;
         }
 
         matched = false;
@@ -821,23 +889,12 @@ nlohmann::json SysInfo::getUsers() const
         }
 
 
-        SudoersProvider sudoersProvider;
-        auto collectedSudoers = sudoersProvider.collect();
-
-        // By default, user is not sudoer.
         userItem["user_roles"] = UNKNOWN_VALUE;
 
-        for (auto& singleSudoer : collectedSudoers)
+        if (SudoersProvider::isUserSudoer(collectedSudoers, username, userGroupNames, sudoersUserAliases))
         {
-            // Searching in content of header
-            auto header = singleSudoer["header"].get<std::string>();
-
-            if (header.find(username) != std::string::npos)
-            {
-                //TODO: user_roles_sudo_sudo_rule_details has more detailed information.
-                userItem["user_roles"] = "sudo";
-
-            }
+            //TODO: user_roles_sudo_sudo_rule_details has more detailed information.
+            userItem["user_roles"] = "sudo";
         }
 
         result.push_back(std::move(userItem));
@@ -955,7 +1012,14 @@ nlohmann::json SysInfo::getBrowserExtensions() const
 
             result.push_back(std::move(extensionItem));
         }
+    }
+    catch (const std::exception&)
+    {
+        // Keep collecting the remaining browsers
+    }
 
+    try
+    {
         // Collect Firefox extensions
         FirefoxAddonsProvider firefoxProvider;
         auto collectedFirefoxExtensions = firefoxProvider.collect();

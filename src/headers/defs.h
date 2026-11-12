@@ -69,7 +69,7 @@
 
 /* Some global names */
 #define __ossec_name    "Wazuh"
-#define __ossec_version "v4.14.6"
+#define __ossec_version "v4.14.10"
 #define __author        "Wazuh Inc."
 #define __contact       "info@wazuh.com"
 #define __site          "http://www.wazuh.com"
@@ -161,6 +161,10 @@ https://www.gnu.org/licenses/gpl.html\n"
 /* Active Response files */
 #define DEFAULTAR_FILE  "ar.conf"
 #define AR_BINDIR       "active-response/bin"
+/* Number of active response commands that previous agent versions can load */
+#define MAX_AR          64
+/* Maximum number of active response commands that an agent loads */
+#define MAX_AR_COMMANDS 1024
 #ifndef WIN32
 #define DEFAULTAR       "etc/shared/" DEFAULTAR_FILE
 #define AGENTCONFIG     "etc/shared/agent.conf"
@@ -347,6 +351,9 @@ https://www.gnu.org/licenses/gpl.html\n"
 
 #define SHAREDCFG_FILE      SHAREDCFG_DIR "/merged.mg"
 #define SHAREDCFG_FILENAME  "merged.mg"
+/* Bundle being received by the agent. As an 8.3 name it gets no NTFS short alias that an entry could write through,
+ * and managers never distribute files whose names start with merged.mg. */
+#define SHAREDCFG_TMPFILENAME "merged.mgt"
 
 #define MAX_QUEUED_EVENTS_PATH "/proc/sys/fs/inotify/max_queued_events"
 
@@ -366,6 +373,15 @@ https://www.gnu.org/licenses/gpl.html\n"
 
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
+#endif
+
+/* Not every agent platform this tree still builds for (AIX, Solaris 10, HP-UX) is guaranteed to define
+ * O_DIRECTORY. Falling back to 0 only loses an early "this must be a directory" check: openat() on a
+ * descriptor that is not a directory fails with ENOTDIR anyway. Note that O_NOFOLLOW deliberately gets
+ * no such fallback -- defining it to 0 would silently disable a security check instead of failing the
+ * build, which is the outcome we want to hear about. */
+#ifndef O_DIRECTORY
+#define O_DIRECTORY 0
 #endif
 
 /* XML global elements */

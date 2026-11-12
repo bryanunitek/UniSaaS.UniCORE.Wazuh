@@ -90,9 +90,7 @@ static int read_main_elements(const OS_XML *xml, int modules,
                 goto fail;
             }
         } else if (chld_node && (strcmp(node[i]->element, osdbd) == 0)) {
-            if ((modules & CDBD) && (Read_DB(chld_node, d1, d2) < 0)) {
-                goto fail;
-            }
+            mwarn("The 'database_output' configuration is deprecated and no longer supported. This configuration will be ignored.");
         } else if (chld_node && (strcmp(node[i]->element, oscsyslogd) == 0)) {
             if ((modules & CSYSLOGD) && (Read_CSyslog(chld_node, d1, d2) < 0)) {
                 goto fail;
@@ -188,7 +186,7 @@ static int read_main_elements(const OS_XML *xml, int modules,
             }
 #endif
         } else if (strcmp(node[i]->element, ossca) == 0) {
-            if ((modules & CWMODULE) && (Read_SCA(xml, node[i], d1) < 0)) {
+            if ((modules & CWMODULE) && (Read_SCA(xml, node[i], d1, d2) < 0)) {
                 goto fail;
             }
         } else if (strcmp(node[i]->element, osvulndetection) == 0) {

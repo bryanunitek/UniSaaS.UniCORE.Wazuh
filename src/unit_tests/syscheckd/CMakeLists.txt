@@ -151,7 +151,7 @@ if(${TARGET} STREQUAL "winagent")
                                      -Wl,--wrap=is_fim_shutdown -Wl,--wrap=_imp__dbsync_initialize \
                                      -Wl,--wrap=_imp__rsync_initialize -Wl,--wrap=fim_db_teardown -Wl,--wrap=utf8_GetShortPathName")
 else()
-  list(APPEND syscheckd_tests_flags "${FIM_DIFF_CHANGES_BASE_FLAGS} -Wl,--wrap=unlink -Wl,--wrap=FileSize")
+  list(APPEND syscheckd_tests_flags "${FIM_DIFF_CHANGES_BASE_FLAGS} -Wl,--wrap=unlink -Wl,--wrap=FileSize -Wl,--wrap=realpath")
 endif()
 
 # run_realtime.c tests
@@ -254,7 +254,8 @@ set(RUN_CHECK_BASE_FLAGS "-Wl,--wrap,sleep -Wl,--wrap,SendMSGPredicated -Wl,--wr
 
 list(APPEND syscheckd_tests_names "run_check")
 if(${TARGET} STREQUAL "agent")
-  list(APPEND syscheckd_tests_flags "${RUN_CHECK_BASE_FLAGS} -Wl,--wrap=sleep -Wl,--wrap,time")
+  list(APPEND syscheckd_tests_flags "${RUN_CHECK_BASE_FLAGS} -Wl,--wrap=sleep -Wl,--wrap,time \
+                                     -Wl,--wrap,StartMQPredicated -Wl,--wrap,SendMSG")
 elseif(${TARGET} STREQUAL "winagent")
   list(APPEND syscheckd_tests_flags "${RUN_CHECK_BASE_FLAGS} -Wl,--wrap=realtime_start \
                                      -Wl,--wrap,WaitForSingleObjectEx -Wl,--wrap,pthread_rwlock_rdlock \
@@ -283,7 +284,17 @@ elseif(${TARGET} STREQUAL "winagent")
                                                                    -Wl,--wrap=_imp__rsync_initialize \
                                                                    -Wl,--wrap=fim_db_teardown")
 else()
-  list(APPEND syscheckd_tests_flags "${RUN_CHECK_BASE_FLAGS} -Wl,--wrap=sleep,--wrap,time")
+  list(APPEND syscheckd_tests_flags "${RUN_CHECK_BASE_FLAGS} -Wl,--wrap=sleep,--wrap,time \
+                                     -Wl,--wrap,StartMQPredicated -Wl,--wrap,SendMSG")
+endif()
+
+# syscom.c listener loop, in its own binary so that wrapping close and accept does not reach the
+# other syscom tests. The listener does not exist on Windows.
+if(NOT ${TARGET} STREQUAL "winagent")
+  list(APPEND syscheckd_tests_names "syscom_main")
+  list(APPEND syscheckd_tests_flags "${FIM_SYSCOM_BASE_FLAGS} -Wl,--wrap,close -Wl,--wrap,accept -Wl,--wrap,select -Wl,--wrap,FOREVER \
+                                     -Wl,--wrap,OS_BindUnixDomain -Wl,--wrap,OS_RecvSecureTCP \
+                                     -Wl,--wrap,OS_SendSecureTCP")
 endif()
 
 # Compiling tests
@@ -360,6 +371,18 @@ if(NOT ${TARGET} STREQUAL "winagent")
   target_link_libraries(test_check_rc_sys SYSCHECK_O ${TEST_DEPS} "${CHECK_RC_SYS_FLAGS}")
   add_test(NAME test_check_rc_sys COMMAND test_check_rc_sys)
 
+  set(CHECK_RC_IF_FLAGS "-Wl,--wrap,socket \
+                          -Wl,--wrap,close \
+                          -Wl,--wrap,ioctl \
+                          -Wl,--wrap,system \
+                          -Wl,--wrap,notify_rk \
+                          -Wl,--wrap,_mterror")
+
+  add_executable(test_check_rc_if test_check_rc_if.c)
+  target_include_directories(test_check_rc_if PRIVATE ${SRC_FOLDER}/rootcheck)
+  target_link_libraries(test_check_rc_if SYSCHECK_O ${TEST_DEPS} "${CHECK_RC_IF_FLAGS}")
+  add_test(NAME test_check_rc_if COMMAND test_check_rc_if)
+
   set(COMMON_FLAGS "-Wl,--wrap,wopendir \
                     -Wl,--wrap,closedir \
                     -Wl,--wrap,w_stat \
@@ -415,7 +438,7 @@ if(${TARGET} STREQUAL "winagent")
                                           -Wl,--wrap,get_UTC_modification_time -Wl,--wrap,fim_sync_push_msg \
                                           -Wl,--wrap=is_fim_shutdown -Wl,--wrap=_imp__dbsync_initialize \
                                           -Wl,--wrap=_imp__rsync_initialize -Wl,--wrap=fim_db_teardown \
-                                          -Wl,--wrap=utf8_stat64 -Wl,--wrap=QueryDosDeviceA"
+                                          -Wl,--wrap=utf8_stat64 -Wl,--wrap=QueryDosDeviceA -Wl,--wrap=win_strerror"
                                           fimdb)
 else()
     target_link_libraries(test_create_db "${CREATE_DB_BASE_FLAGS} -Wl,--wrap=lstat -Wl,--wrap=count_watches \

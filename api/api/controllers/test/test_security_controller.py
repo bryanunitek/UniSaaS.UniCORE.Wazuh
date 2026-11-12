@@ -47,6 +47,8 @@ def mock_request():
         with patch('api.controllers.security_controller.request', MagicMock) as m_req:
             m_req.json = AsyncMock(side_effect=lambda: {'ctx': ''} )
             m_req.get = MagicMock(return_value=None)
+            m_req.client = MagicMock()
+            m_req.client.host = 'ip'
             m_req.query_params = MagicMock()
             m_req.query_params.get = MagicMock(return_value=None)
             m_req.context = {
@@ -87,7 +89,7 @@ async def test_login_user(mock_token, mock_exc, mock_dapi, mock_remove, mock_dfu
 @patch('api.controllers.security_controller.raise_if_exc', return_value=CustomAffectedItems())
 @patch('api.controllers.security_controller.generate_token', return_value='token')
 @pytest.mark.parametrize('mock_bool', [True, False])
-async def test_login_user_ko(mock_token, mock_exc, mock_dapi, mock_remove, mock_dfunc, mock_bool):
+async def test_login_user_ko(mock_token, mock_exc, mock_dapi, mock_remove, mock_dfunc, mock_bool, mock_request):
     """Verify 'login_user' endpoint is handling WazuhException as expected."""
     mock_token.side_effect = WazuhException(999)
     result = await login_user(user='001', raw=mock_bool)
@@ -849,7 +851,7 @@ async def test_remove_role_rule(mock_exc, mock_dapi, mock_remove, mock_dfunc, mo
 @patch('api.controllers.security_controller.remove_nones_to_dict')
 @patch('api.controllers.security_controller.DistributedAPI.__init__', return_value=None)
 @patch('api.controllers.security_controller.raise_if_exc', return_value=CustomAffectedItems())
-async def test_get_rbac_resources(mock_exc, mock_dapi, mock_remove, mock_dfunc):
+async def test_get_rbac_resources(mock_exc, mock_dapi, mock_remove, mock_dfunc, mock_request):
     """Verify 'get_rbac_resources' endpoint is working as expected."""
     result = await get_rbac_resources()
     f_kwargs = {'resource': None
@@ -859,7 +861,8 @@ async def test_get_rbac_resources(mock_exc, mock_dapi, mock_remove, mock_dfunc):
                                       request_type='local_any',
                                       is_async=False,
                                       logger=ANY,
-                                      wait_for_complete=True
+                                      wait_for_complete=True,
+                                      rbac_permissions=mock_request.context['token_info']['rbac_policies']
                                       )
     mock_exc.assert_called_once_with(mock_dfunc.return_value)
     mock_remove.assert_called_once_with(f_kwargs)
@@ -871,7 +874,7 @@ async def test_get_rbac_resources(mock_exc, mock_dapi, mock_remove, mock_dfunc):
 @patch('api.controllers.security_controller.remove_nones_to_dict')
 @patch('api.controllers.security_controller.DistributedAPI.__init__', return_value=None)
 @patch('api.controllers.security_controller.raise_if_exc', return_value=CustomAffectedItems())
-async def test_get_rbac_actions(mock_exc, mock_dapi, mock_remove, mock_dfunc):
+async def test_get_rbac_actions(mock_exc, mock_dapi, mock_remove, mock_dfunc, mock_request):
     """Verify 'get_rbac_actions' endpoint is working as expected."""
     result = await get_rbac_actions()
     f_kwargs = {'endpoint': None
@@ -881,7 +884,8 @@ async def test_get_rbac_actions(mock_exc, mock_dapi, mock_remove, mock_dfunc):
                                       request_type='local_any',
                                       is_async=False,
                                       logger=ANY,
-                                      wait_for_complete=True
+                                      wait_for_complete=True,
+                                      rbac_permissions=mock_request.context['token_info']['rbac_policies']
                                       )
     mock_exc.assert_called_once_with(mock_dfunc.return_value)
     mock_remove.assert_called_once_with(f_kwargs)

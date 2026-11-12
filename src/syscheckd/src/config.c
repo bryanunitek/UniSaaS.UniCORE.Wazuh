@@ -103,6 +103,8 @@ void free_whodata_event(whodata_evt *w_evt) {
     if (w_evt->cwd) free(w_evt->cwd);
     if (w_evt->audit_name) free(w_evt->audit_name);
     if (w_evt->audit_uid) free(w_evt->audit_uid);
+    if (w_evt->audit_gid) free(w_evt->audit_gid);
+    if (w_evt->audit_group_name) free(w_evt->audit_group_name);
     if (w_evt->effective_name) free(w_evt->effective_name);
     if (w_evt->effective_uid) free(w_evt->effective_uid);
     if (w_evt->group_id) free(w_evt->group_id);
@@ -141,8 +143,8 @@ cJSON *getSyscheckConfig(void) {
     cJSON_AddStringToObject(syscfg, "skip_sys", syscheck.skip_fs.sys ? "yes" : "no");
     cJSON_AddStringToObject(syscfg, "skip_proc", syscheck.skip_fs.proc ? "yes" : "no");
     if (syscheck.scan_on_start) cJSON_AddStringToObject(syscfg,"scan_on_start","yes"); else cJSON_AddStringToObject(syscfg,"scan_on_start","no");
-    if (syscheck.scan_day) cJSON_AddStringToObject(syscfg,"scan_day",syscheck.scan_day);
-    if (syscheck.scan_time) cJSON_AddStringToObject(syscfg,"scan_time",syscheck.scan_time);
+    if (syscheck.scan_day_str) cJSON_AddStringToObject(syscfg,"scan_day",syscheck.scan_day_str);
+    if (syscheck.scan_time_str) cJSON_AddStringToObject(syscfg,"scan_time",syscheck.scan_time_str);
     cJSON_AddNumberToObject(syscfg, "max_files_per_second", syscheck.max_files_per_second);
 
     cJSON * file_limit = cJSON_CreateObject();

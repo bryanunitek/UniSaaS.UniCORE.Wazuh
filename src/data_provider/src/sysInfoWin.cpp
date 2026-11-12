@@ -820,8 +820,9 @@ void expandPortData(T data, const std::map<pid_t, std::string>& processDataList,
         for (auto i = 0ul; i < data->dwNumEntries; ++i)
         {
             nlohmann::json port;
-            std::make_unique<PortImpl>(std::make_shared<WindowsPortWrapper>(data->table[i], processDataList))->buildPortData(port);
-            result.push_back(port);
+            const WindowsPortWrapper wrapper(data->table[i], processDataList);
+            PortImpl(wrapper).buildPortData(port);
+            result.push_back(std::move(port));
         }
     }
 }
@@ -907,8 +908,12 @@ void expandFromRegistry(const HKEY key, const std::string& subKey, const std::st
         {
             // Get install path from registry, based on version key.
             const auto dir {Utils::Registry {key, versionKey, KEY_READ | KEY_WOW64_64KEY}.string(field)};
+
             // Add install path to dirList.
-            postAction(dir);
+            if (Utils::isLocalFixedPath(dir))
+            {
+                postAction(dir);
+            }
         }
         catch (const std::exception& e)
         {
@@ -927,10 +932,32 @@ const std::set<std::string> getPythonDirectories()
         pythonDirList.insert(pythonDir + R"(Lib\dist-packages)");
     };
 
+    const auto storePostAction = [&](const std::string & packageRootFolder)
+    {
+        /*
+         * Only the Python Store packages bundle a site-packages directory. The prefix is
+         * anchored to the folder name; PackageRootFolder has no trailing separator, unlike
+         * InstallPath.
+         */
+        if (packageRootFolder.find(std::string(R"(\)") + PYTHON_STORE_PACKAGE_PREFIX) != std::string::npos)
+        {
+            pythonDirList.insert(packageRootFolder + R"(\Lib\site-packages)");
+        }
+    };
+
     try
     {
         expandFromRegistry(HKEY_USERS, R"(*\SOFTWARE\Python\PythonCore\*\InstallPath)", "", postAction);
         expandFromRegistry(HKEY_LOCAL_MACHINE, R"(SOFTWARE\Python\PythonCore\*\InstallPath)", "", postAction);
+        /*
+         * Microsoft Store Python does not expose its PEP 514 registration under HKEY_USERS
+         * (it lives in the MSIX virtualized hive), so its site-packages directory is derived
+         * from the package location kept on the AppModel repository.
+         */
+        expandFromRegistry(HKEY_USERS,
+                           std::string(R"(*\)") + APPLICATION_STORE_REGISTRY + R"(\*)",
+                           "PackageRootFolder",
+                           storePostAction);
     }
     catch (const std::exception&)
     {
@@ -1178,9 +1205,6 @@ nlohmann::json SysInfo::getUsers() const
         //TODO: Avoid this iteration, move logic to LoggedInUsersProvider
         for (auto& item : collectedLoggedInUser)
         {
-            // By default, user is not logged in.
-            userItem["login_status"] = 0;
-
             // tty,host,time and pid can take more than one value due to different logins.
             if (item["user"] == username)
             {
@@ -1341,7 +1365,14 @@ nlohmann::json SysInfo::getBrowserExtensions() const
 
             result.push_back(std::move(extensionItem));
         }
+    }
+    catch (const std::exception&)
+    {
+        // Keep collecting the remaining browsers
+    }
 
+    try
+    {
         // Collect Firefox extensions
         FirefoxAddonsProvider firefoxProvider;
         auto collectedFirefoxExtensions = firefoxProvider.collect();
@@ -1375,7 +1406,14 @@ nlohmann::json SysInfo::getBrowserExtensions() const
 
             result.push_back(std::move(extensionItem));
         }
+    }
+    catch (const std::exception&)
+    {
+        // Keep collecting the remaining browsers
+    }
 
+    try
+    {
         // Collect Internet Explorer extensions
         IEExtensionsProvider ieProvider;
         auto collectedIEExtensions = ieProvider.collect();

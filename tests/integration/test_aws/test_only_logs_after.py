@@ -6,8 +6,10 @@
 This module will contain all cases for the only logs after test suite
 """
 
+import re
+
 import pytest
-from datetime import datetime
+from datetime import datetime, timedelta
 # qa-integration-framework imports
 from wazuh_testing import session_parameters
 from wazuh_testing.constants.paths.aws import S3_CLOUDTRAIL_DB_PATH, AWS_SERVICES_DB_PATH
@@ -26,6 +28,9 @@ from .utils import ERROR_MESSAGE, TIMEOUT, local_internal_options
 
 pytestmark = [pytest.mark.server]
 
+# Bucket types whose marker the module rewinds to the day before the last processed key
+LATE_ARRIVAL_BUCKET_TYPES = {'cloudtrail', 'alb', 'clb', 'nlb'}
+
 # Set test configurator for the module
 configurator.module = 'only_logs_after_test_module'
 
@@ -40,7 +45,7 @@ configurator.configure_test(configuration_file='bucket_configuration_without_onl
                          zip(configurator.test_configuration_template, configurator.metadata),
                          ids=configurator.cases_ids)
 def test_bucket_without_only_logs_after(
-        test_configuration, metadata, create_test_bucket, manage_bucket_files,
+        test_configuration, metadata, mark_cases_as_skipped, create_test_bucket, manage_bucket_files,
         load_wazuh_basic_configuration, set_wazuh_configuration, clean_s3_cloudtrail_db,
         configure_local_internal_options_function, truncate_monitored_files, restart_wazuh_function,
         file_monitoring
@@ -296,7 +301,7 @@ configurator.configure_test(configuration_file='bucket_configuration_with_only_l
                          zip(configurator.test_configuration_template, configurator.metadata),
                          ids=configurator.cases_ids)
 def test_bucket_with_only_logs_after(
-        test_configuration, metadata, create_test_bucket, manage_bucket_files,
+        test_configuration, metadata, mark_cases_as_skipped, create_test_bucket, manage_bucket_files,
         load_wazuh_basic_configuration, set_wazuh_configuration, clean_s3_cloudtrail_db,
         configure_local_internal_options_function, truncate_monitored_files, restart_wazuh_function, file_monitoring
 ):
@@ -664,15 +669,8 @@ def test_inspector_with_only_logs_after(
 
     assert log_monitor.callback_result is not None, ERROR_MESSAGE['incorrect_parameters']
 
-    # For inspector, validate V1 and V2 APIs both execute successfully
+    # For inspector, validate InspectorV2 API executed successfully
     if service_type == 'inspector' and expected_results_min is not None:
-        # Validate InspectorV1 API executed (can return 0+ events)
-        log_monitor.start(
-            timeout=TIMEOUT[10],
-            callback=event_monitor.make_aws_callback(r'.*\[InspectorV1\] \d+ events collected and processed'),
-        )
-        assert log_monitor.callback_result is not None, 'InspectorV1 API did not execute - check logs'
-
         # Validate InspectorV2 API executed (can return 0+ events or report no updates)
         log_monitor.start(
             timeout=TIMEOUT[10],
@@ -716,8 +714,8 @@ configurator.configure_test(cases_file='cases_bucket_multiple_calls.yaml')
                          configurator.metadata,
                          ids=configurator.cases_ids)
 def test_bucket_multiple_calls(
-        metadata, clean_s3_cloudtrail_db, s3_client, create_test_bucket, manage_bucket_files,
-        load_wazuh_basic_configuration, restart_wazuh_function
+        metadata, mark_cases_as_skipped, clean_s3_cloudtrail_db, s3_client, create_test_bucket, manage_bucket_files,
+        load_wazuh_basic_configuration, restart_wazuh_function, record_uploaded_key
 ):
     """
     description: Call the AWS module multiple times with different only_logs_after values.
@@ -773,9 +771,12 @@ def test_bucket_multiple_calls(
 
     bucket_type = metadata['bucket_type']
     bucket_name = metadata['bucket_name']
+    data_bucket_name = metadata.get('original_bucket_name', bucket_name)
     expected_results = metadata['expected_results']
     path = metadata.get('path')
     region = US_EAST_1_REGION
+    only_logs_after = metadata.get('only_logs_after', '2022-NOV-20')
+    later_only_logs_after = metadata.get('later_only_logs_after', '2022-NOV-22')
 
     base_parameters = [
         '--bucket', bucket_name,
@@ -786,6 +787,11 @@ def test_bucket_multiple_calls(
 
     if path is not None:
         base_parameters.extend(['--trail_prefix', path])
+
+    # Scope to the test data account so the module doesn't iterate other account prefixes
+    # in the shared bucket (which would produce extra "No logs to process" messages).
+    if metadata.get('account_id'):
+        base_parameters.extend(['--aws_account_id', metadata['account_id']])
 
     # Call the module without only_logs_after and check that no logs were processed
     # Get bucket type
@@ -811,7 +817,7 @@ def test_bucket_multiple_calls(
 
     # Call the module with only_logs_after set in the past and check that the expected number of logs were processed
     analyze_command_output(
-        command_output=call_aws_module(*base_parameters, ONLY_LOGS_AFTER_PARAM, '2022-NOV-20'),
+        command_output=call_aws_module(*base_parameters, ONLY_LOGS_AFTER_PARAM, only_logs_after),
         callback=event_monitor.callback_detect_event_processed,
         expected_results=expected_results,
         error_message=ERROR_MESSAGE['incorrect_event_number']
@@ -822,7 +828,7 @@ def test_bucket_multiple_calls(
         # For VPC the number of messages depend on the number of flow log IDs obtained by the module which may vary.
         expected_skipped_logs_step_3 = metadata.get('expected_skipped_logs_step_3', 1)
         analyze_command_output(
-            command_output=call_aws_module(*base_parameters, ONLY_LOGS_AFTER_PARAM, '2022-NOV-20'),
+            command_output=call_aws_module(*base_parameters, ONLY_LOGS_AFTER_PARAM, only_logs_after),
             callback=event_monitor.make_aws_callback(pattern),
             expected_results=expected_skipped_logs_step_3,
             error_message=ERROR_MESSAGE['incorrect_event_number'],
@@ -832,7 +838,7 @@ def test_bucket_multiple_calls(
         # Call the module with only_logs_after set with an early date than the one set previously and check that no logs
         # were processed, there were no duplicates
         analyze_command_output(
-            command_output=call_aws_module(*base_parameters, ONLY_LOGS_AFTER_PARAM, '2022-NOV-22'),
+            command_output=call_aws_module(*base_parameters, ONLY_LOGS_AFTER_PARAM, later_only_logs_after),
             callback=event_monitor.make_aws_callback(pattern),
             expected_results=expected_skipped_logs_step_3 - 1 if expected_skipped_logs_step_3 > 1 else 1,
             error_message=ERROR_MESSAGE['incorrect_event_number'],
@@ -842,7 +848,7 @@ def test_bucket_multiple_calls(
         # Call the module with the same parameters in and check there were no duplicates
         expected_skipped_logs_step_3 = metadata.get('expected_skipped_logs_step_3', 1)
         analyze_command_output(
-            command_output=call_aws_module(*base_parameters, ONLY_LOGS_AFTER_PARAM, '2022-NOV-20'),
+            command_output=call_aws_module(*base_parameters, ONLY_LOGS_AFTER_PARAM, only_logs_after),
             callback=event_monitor.make_aws_callback(pattern),
             expected_results=expected_skipped_logs_step_3,
             error_message=ERROR_MESSAGE['incorrect_event_number']
@@ -851,7 +857,7 @@ def test_bucket_multiple_calls(
         # Call the module with only_logs_after set with an early date than the one set previously and check that no logs
         # were processed, there were no duplicates
         analyze_command_output(
-            command_output=call_aws_module(*base_parameters, ONLY_LOGS_AFTER_PARAM, '2022-NOV-22'),
+            command_output=call_aws_module(*base_parameters, ONLY_LOGS_AFTER_PARAM, later_only_logs_after),
             callback=event_monitor.make_aws_callback(pattern),
             expected_results=expected_skipped_logs_step_3 - 1 if expected_skipped_logs_step_3 > 1 else 1,
             error_message=ERROR_MESSAGE['incorrect_event_number']
@@ -859,28 +865,57 @@ def test_bucket_multiple_calls(
 
     # Upload a log file for the day of the test execution and call the module without only_logs_after and check that
     # only the uploaded logs were processed and the last marker is specified in the DB.
-    last_marker_key = get_last_file_key(bucket_type, bucket_name, datetime.utcnow(), region, s3_client)
+    effective_bucket_type = bucket_type
+    if bucket_type == 'custom':
+        effective_bucket_type = data_bucket_name.split('-')[1]
+    elif bucket_type == 'guardduty' and 'native' in data_bucket_name:
+        effective_bucket_type = 'native-guardduty'
+    # Upload under the run namespace (metadata['path']) so the module - configured with the same
+    # namespaced <path> - actually finds the file, and it lands inside the prefix this run cleans up.
+    ns_prefix = metadata.get('path') or ''
+    last_marker_key = get_last_file_key(effective_bucket_type, bucket_name, datetime.utcnow(), region,
+                                        s3_client, prefix=ns_prefix)
+    # The run namespace (issue #38194) also holds the copied CloudTrail/ELB seeds under '<run>/AWSLogs/'.
+    # Custom bucket types (kms, macie, waf, ...) keep their data directly under '<run>/<date>/', so
+    # get_last_file_key - which lists the whole namespace - would pick the seed ('AWSLogs/' sorts after
+    # digits) instead of the type's own last file. When the type has data outside AWSLogs/, take that as
+    # the marker so it matches what the module actually processes. No-op locally (no namespace).
+    if ns_prefix:
+        own_keys = [obj.key for obj in s3_client.Bucket(bucket_name).objects.filter(Prefix=ns_prefix)
+                    if 'AWSLogs/' not in obj.key]
+        if own_keys:
+            last_marker_key = max(own_keys)
     if bucket_type == VPC_FLOW_TYPE:
         data, key = generate_file(bucket_type=bucket_type,
                                   bucket_name=bucket_name,
                                   region=region,
-                                  prefix='',
+                                  prefix=ns_prefix,
                                   suffix='',
                                   date='',
                                   flow_log_id=metadata['flow_log_id'])
     else:
         data, key = generate_file(bucket_type=bucket_type,
-                                  bucket_name=bucket_name,
+                                  bucket_name=data_bucket_name,
                                   region=region,
-                                  prefix='',
+                                  prefix=ns_prefix,
                                   suffix='',
                                   date='')
     metadata['filename'] = key
+
+    # Record the key before uploading so a hard cancel during this test still cleans it up.
+    record_uploaded_key(key)
 
     upload_bucket_file(bucket_name=bucket_name,
                        data=data,
                        key=key,
                        client=s3_client)
+
+    # The module rewinds the marker of these types to the day before the last processed key, to read the files
+    # delivered after a greater key of the same prefix
+    if bucket_type in LATE_ARRIVAL_BUCKET_TYPES:
+        date_match = re.search(r'\d{4}/\d{2}/\d{2}', last_marker_key)
+        rewind_day = datetime.strptime(date_match.group(), '%Y/%m/%d') - timedelta(days=1)
+        last_marker_key = f'{last_marker_key[:date_match.start()]}{rewind_day:%Y/%m/%d}'
 
     pattern = fr"{MARKER}{last_marker_key}"
 
@@ -951,14 +986,6 @@ def test_inspector_multiple_calls(
     # Call the module with only_logs_after set in the past and check that the expected number of logs were processed.
     # Validate V1 and V2 APIs both execute successfully, and total events meets minimum (106)
     command_output = call_aws_module(*base_parameters, ONLY_LOGS_AFTER_PARAM, '2025-SEP-15')
-
-    # Validate InspectorV1 API executed (can return 0+ events)
-    analyze_command_output(
-        command_output=command_output,
-        callback=event_monitor.make_aws_callback(r'.*\[InspectorV1\] \d+ events collected and processed'),
-        expected_results=1,
-        error_message='InspectorV1 API did not execute - check logs'
-    )
 
     # Validate InspectorV2 API executed (can return 0+ events or report no updates)
     analyze_command_output(

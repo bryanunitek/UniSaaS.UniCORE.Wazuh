@@ -40,12 +40,12 @@ info:
 
     <SecurityDefinitions />
 
-  version: '4.14.6'
+  version: '4.14.10'
   x-revision: 'rc2'
   title: 'Wazuh API REST'
   license:
     name: 'GPL 2.0'
-    url: 'https://github.com/wazuh/wazuh/blob/v4.14.6/LICENSE'
+    url: 'https://github.com/wazuh/wazuh/blob/v4.14.10/LICENSE'
 
 servers:
   - url: '{protocol}://{host}:{port}'
@@ -1556,8 +1556,37 @@ components:
           IP, IP/NET, ANY"
           type: string
           format: alphanumeric_symbols
+        force:
+          $ref: '#/components/schemas/AgentAddForce'
       required:
       - name
+
+    AgentAddForce:
+      type: object
+      description: "Remove the old agent with the same name or IP if the configuration is matched. Unlike
+      `/agents/insert`, replacement is disabled unless `enabled` is set to `true`"
+      properties:
+        enabled:
+          type: boolean
+          default: False
+          description: "Enable force option"
+        disconnected_time:
+          type: object
+          properties:
+            enabled:
+              type: boolean
+              default: True
+              description: "Enable force disconnected_time option"
+            value:
+              type: string
+              default: "1h"
+              description: "Time the agent must has been disconnected to force the insertion. Time in seconds, ‘[n_days]d’, ‘[n_hours]h’, ‘[n_minutes]m’ or ‘[n_seconds]s’. For example, `7d`, `10s` and `10` are valid values. If no time unit is specified, seconds are used"
+              format: timeframe
+        after_registration_time:
+          type: string
+          default: "1h"
+          description: "Time the agent must has been registered to force the insertion. Time in seconds, ‘[n_days]d’, ‘[n_hours]h’, ‘[n_minutes]m’ or ‘[n_seconds]s’. For example, `7d`, `10s` and `10` are valid values. If no time unit is specified, seconds are used"
+          format: timeframe
 
     AgentGroup:
       type: object
@@ -2685,7 +2714,11 @@ components:
             tcp_sessions:
               type: integer
               format: int32
-              description: "Current active TCP sessions (agents)"
+              description: "Current active TCP sessions"
+            tcp_sessions_unassociated:
+              type: integer
+              format: int32
+              description: "Current active TCP sessions not yet associated with an agent (subset of tcp_sessions)"
 
     WazuhAnalysisdStatsItem:
       type: object
@@ -3865,8 +3898,6 @@ components:
           $ref: '#/components/schemas/DaemonStatus'
         wazuh-csyslogd:
           $ref: '#/components/schemas/DaemonStatus'
-        wazuh-dbd:
-          $ref: '#/components/schemas/DaemonStatus'
         wazuh-execd:
           $ref: '#/components/schemas/DaemonStatus'
         wazuh-integratord:
@@ -3944,8 +3975,6 @@ components:
           type: array
           items:
             type: object
-        database_output:
-          type: object
         email_alerts:
           type: object
         gcp-pubsub:
@@ -4268,6 +4297,10 @@ components:
           type: number
           format: float
           description: "Number of TCP active sessions during the last five seconds"
+        tcp_sessions_unassociated:
+          type: number
+          format: float
+          description: "Number of TCP active sessions not yet associated with an agent during the last five seconds (subset of tcp_sessions)"
         total_queue_size:
           type: number
           format: float
@@ -4347,8 +4380,6 @@ components:
           wazuh-authd:
             $ref: '#/components/schemas/LogSummary'
           wazuh-csyslogd:
-            $ref: '#/components/schemas/LogSummary'
-          wazuh-dbd:
             $ref: '#/components/schemas/LogSummary'
           wazuh-execd:
             $ref: '#/components/schemas/LogSummary'
@@ -6950,7 +6981,6 @@ components:
         - client_buffer
         - cluster
         - command
-        - database_output
         - email_alerts
         - global
         - integration
@@ -7743,7 +7773,7 @@ paths:
                 api_version: "v4.5.0"
                 revision: 'beta1'
                 license_name: "GPL 2.0"
-                license_url: "https://github.com/wazuh/wazuh/blob/v4.14.6/LICENSE"
+                license_url: "https://github.com/wazuh/wazuh/blob/v4.14.10/LICENSE"
                 hostname: "wazuh"
                 timestamp: "2019-04-02T08:08:11Z"
 
@@ -10591,6 +10621,7 @@ paths:
                         drop_privileges: true
                         experimental_features: false
                         max_upload_size: 10485760
+                        auth_context_max_payload_size: 65536
                         authentication_pool_size: 2
                         intervals:
                           request_timeout: 10
@@ -10638,6 +10669,7 @@ paths:
                         drop_privileges: true
                         experimental_features: false
                         max_upload_size: 10485760
+                        auth_context_max_payload_size: 65536
                         authentication_pool_size: 2
                         intervals:
                           request_timeout: 10
@@ -10685,6 +10717,7 @@ paths:
                         drop_privileges: true
                         experimental_features: false
                         max_upload_size: 10485760
+                        auth_context_max_payload_size: 65536
                         authentication_pool_size: 2
                         intervals:
                           request_timeout: 10
@@ -10772,7 +10805,6 @@ paths:
                       wazuh-analysisd: running
                       wazuh-authd: stopped
                       wazuh-csyslogd: stopped
-                      wazuh-dbd: stopped
                       wazuh-monitord: running
                       wazuh-execd: running
                       wazuh-integratord: stopped
@@ -11221,6 +11253,7 @@ paths:
                             size: 131072
                             usage: 0
                         tcp_sessions: 0
+                        tcp_sessions_unassociated: 0
                   total_affected_items: 1
                   failed_items: []
                   total_failed_items: 0
@@ -11744,6 +11777,7 @@ paths:
                     - queue_size: 0.0
                       total_queue_size: 131072.0
                       tcp_sessions: 4.0
+                      tcp_sessions_unassociated: 0.0
                       evt_count: 9089.0
                       ctrl_msg_count: 2099.0
                       discarded_count: 0.0
@@ -12533,7 +12567,6 @@ paths:
                       wazuh-analysisd: "running"
                       wazuh-authd: "running"
                       wazuh-csyslogd: "stopped"
-                      wazuh-dbd: "stopped"
                       wazuh-monitor": "running"
                       wazuh-execd: "running"
                       wazuh-integratord: "stopped"
@@ -12810,6 +12843,7 @@ paths:
                             size: 131072
                             usage: 0
                         tcp_sessions: 0
+                        tcp_sessions_unassociated: 0
                   total_affected_items: 1
                   failed_items: []
                   total_failed_items: 0
@@ -13306,6 +13340,7 @@ paths:
                     - queue_size: 0.0
                       total_queue_size: 131072.0
                       tcp_sessions: 4.0
+                      tcp_sessions_unassociated: 0.0
                       evt_count: 9089.0
                       ctrl_msg_count: 2099.0
                       discarded_count: 0.0
@@ -13497,6 +13532,7 @@ paths:
                         drop_privileges: true
                         experimental_features: false
                         max_upload_size: 10485760
+                        auth_context_max_payload_size: 65536
                         authentication_pool_size: 2
                         intervals:
                           request_timeout: 10
@@ -18365,6 +18401,8 @@ paths:
       summary: 'List RBAC actions'
       description: 'Get all RBAC actions, including the potential related resources and endpoints.'
       operationId: api.controllers.security_controller.get_rbac_actions
+      x-rbac-actions:
+        - $ref: "#/x-rbac-catalog/actions/security:read_config"
       parameters:
         - $ref: '#/components/parameters/endpoint'
         - $ref: '#/components/parameters/pretty'
@@ -18422,6 +18460,8 @@ paths:
       summary: 'List RBAC resources'
       description: 'This method should be called to get all current defined RBAC resources.'
       operationId: api.controllers.security_controller.get_rbac_resources
+      x-rbac-actions:
+        - $ref: "#/x-rbac-catalog/actions/security:read_config"
       parameters:
         - $ref: '#/components/parameters/resource_list'
         - $ref: '#/components/parameters/pretty'

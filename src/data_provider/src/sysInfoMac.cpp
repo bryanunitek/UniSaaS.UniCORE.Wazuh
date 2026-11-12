@@ -12,6 +12,7 @@
 #include "cmdHelper.h"
 #include "stringHelper.h"
 #include "filesystemHelper.h"
+#include "processInfoMac.h"
 #include "osinfo/sysOsParsers.h"
 #include <libproc.h>
 #include <pwd.h>
@@ -27,6 +28,7 @@
 #include "hardware/factoryHardwareFamilyCreator.h"
 #include "hardware/hardwareWrapperImplMac.h"
 #include "osPrimitivesImplMac.h"
+#include "processesWrapperImplMac.h"
 #include "sqliteWrapperTemp.h"
 #include "packages/modernPackageDataRetriever.hpp"
 #include "groups_darwin.hpp"
@@ -73,8 +75,7 @@ static nlohmann::json getProcessInfo(const ProcessTaskInfo& taskInfo, const pid_
 {
     nlohmann::json jsProcessInfo{};
     jsProcessInfo["pid"]        = std::to_string(pid);
-    jsProcessInfo["name"]       = taskInfo.pbsd.pbi_name;
-
+    jsProcessInfo["name"]       = resolveProcessName(pid, taskInfo.pbsd.pbi_name);
     jsProcessInfo["state"]      = UNKNOWN_VALUE;
     jsProcessInfo["ppid"]       = taskInfo.pbsd.pbi_ppid;
 
@@ -308,49 +309,51 @@ nlohmann::json SysInfo::getOsInfo() const
     return ret;
 }
 
-static void getProcessesSocketFD(std::map<ProcessInfo, std::vector<std::shared_ptr<socket_fdinfo>>>& processSocket)
+static void getProcessesSocketFD(std::map<ProcessInfo, std::vector<socket_fdinfo>>& processSocket)
 {
-    int32_t maxProcess { 0 };
-    auto maxProcessLen { sizeof(maxProcess) };
+    std::vector<pid_t> pids;
 
-    if (!sysctlbyname("kern.maxproc", &maxProcess, &maxProcessLen, nullptr, 0))
+    try
     {
-        auto pids { std::make_unique<pid_t[]>(maxProcess) };
-        const auto processesCount { proc_listallpids(pids.get(), maxProcess) };
+        pids = listAllPids(OsPrimitivesMac{});
+    }
+    catch (const std::system_error&)
+    {
+        // Preserve the previous behavior: silently skip port collection if
+        // kern.maxproc can't be read, rather than propagating the error.
+        return;
+    }
 
-        for (auto i = 0 ; i < processesCount ; ++i)
+    for (const auto pid : pids)
+    {
+        proc_bsdinfo processInformation {};
+
+        if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &processInformation, PROC_PIDTBSDINFO_SIZE) != -1)
         {
-            const auto pid { pids[i] };
+            const std::string processName { resolveProcessName(pid, processInformation.pbi_name) };
+            const ProcessInfo processData { pid, processName };
 
-            proc_bsdinfo processInformation {};
+            const auto processFDBufferSize { proc_pidinfo(pid, PROC_PIDLISTFDS, 0, 0, 0) };
 
-            if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &processInformation, PROC_PIDTBSDINFO_SIZE) != -1)
+            if (processFDBufferSize != -1)
             {
-                const std::string processName { processInformation.pbi_name };
-                const ProcessInfo processData { pid, processName };
+                auto processFDInformationBuffer { std::make_unique<char[]>(processFDBufferSize) };
 
-                const auto processFDBufferSize { proc_pidinfo(pid, PROC_PIDLISTFDS, 0, 0, 0) };
-
-                if (processFDBufferSize != -1)
+                if (proc_pidinfo(pid, PROC_PIDLISTFDS, 0, processFDInformationBuffer.get(), processFDBufferSize) != -1)
                 {
-                    auto processFDInformationBuffer { std::make_unique<char[]>(processFDBufferSize) };
+                    auto processFDInformation { reinterpret_cast<proc_fdinfo*>(processFDInformationBuffer.get())};
 
-                    if (proc_pidinfo(pid, PROC_PIDLISTFDS, 0, processFDInformationBuffer.get(), processFDBufferSize) != -1)
+                    for (auto j = 0ul; j < processFDBufferSize / PROC_PIDLISTFD_SIZE; ++j )
                     {
-                        auto processFDInformation { reinterpret_cast<proc_fdinfo*>(processFDInformationBuffer.get())};
-
-                        for (auto j = 0ul; j < processFDBufferSize / PROC_PIDLISTFD_SIZE; ++j )
+                        if (PROX_FDTYPE_SOCKET == processFDInformation[j].proc_fdtype)
                         {
-                            if (PROX_FDTYPE_SOCKET == processFDInformation[j].proc_fdtype)
-                            {
-                                auto socketInfo { std::make_shared<socket_fdinfo>() };
+                            socket_fdinfo socketInfo {};
 
-                                if (PROC_PIDFDSOCKETINFO_SIZE == proc_pidfdinfo(pid, processFDInformation[j].proc_fd, PROC_PIDFDSOCKETINFO, socketInfo.get(), PROC_PIDFDSOCKETINFO_SIZE))
+                            if (PROC_PIDFDSOCKETINFO_SIZE == proc_pidfdinfo(pid, processFDInformation[j].proc_fd, PROC_PIDFDSOCKETINFO, &socketInfo, PROC_PIDFDSOCKETINFO_SIZE))
+                            {
+                                if (std::find(s_validFDSock.begin(), s_validFDSock.end(), socketInfo.psi.soi_kind) != s_validFDSock.end())
                                 {
-                                    if (socketInfo && std::find(s_validFDSock.begin(), s_validFDSock.end(), socketInfo->psi.soi_kind) != s_validFDSock.end())
-                                    {
-                                        processSocket[processData].push_back(socketInfo);
-                                    }
+                                    processSocket[processData].push_back(socketInfo);
                                 }
                             }
                         }
@@ -364,28 +367,20 @@ static void getProcessesSocketFD(std::map<ProcessInfo, std::vector<std::shared_p
 nlohmann::json SysInfo::getPorts() const
 {
     nlohmann::json ports;
-    std::map<ProcessInfo, std::vector<std::shared_ptr<socket_fdinfo>>> fdMap;
+    std::map<ProcessInfo, std::vector<socket_fdinfo>> fdMap;
     getProcessesSocketFD(fdMap);
 
     for (const auto& processInfo : fdMap)
     {
-        for (const auto& fdSocket : processInfo.second )
+        for (const auto& fdSocket : processInfo.second)
         {
             nlohmann::json port;
-            std::make_unique<PortImpl>(std::make_shared<BSDPortWrapper>(processInfo.first, fdSocket))->buildPortData(port);
+            const BSDPortWrapper wrapper(processInfo.first, fdSocket);
+            PortImpl(wrapper).buildPortData(port);
 
-            const auto portFound
+            if (ports.end() == std::find(ports.begin(), ports.end(), port))
             {
-                std::find_if(ports.begin(), ports.end(),
-                             [&port](const auto & element)
-                {
-                    return 0 == port.dump().compare(element.dump());
-                })
-            };
-
-            if (ports.end() == portFound)
-            {
-                ports.push_back(port);
+                ports.push_back(std::move(port));
             }
         }
     }
@@ -395,27 +390,11 @@ nlohmann::json SysInfo::getPorts() const
 
 void SysInfo::getProcessesInfo(std::function<void(nlohmann::json&)> callback) const
 {
-    int32_t maxProc{};
-    size_t len { sizeof(maxProc) };
-    const auto ret { sysctlbyname("kern.maxproc", &maxProc, &len, NULL, 0) };
+    const auto pids { listAllPids(OsPrimitivesMac{}) };
 
-    if (ret)
-    {
-        throw std::system_error
-        {
-            ret,
-            std::system_category(),
-            "Error reading kernel max processes."
-        };
-    }
-
-    const auto spPids         { std::make_unique<pid_t[]>(maxProc) };
-    const auto processesCount { proc_listallpids(spPids.get(), maxProc) };
-
-    for (int index = 0; index < processesCount; ++index)
+    for (const auto pid : pids)
     {
         ProcessTaskInfo taskInfo{};
-        const auto pid { spPids.get()[index] };
         const auto sizeTask
         {
             proc_pidinfo(pid, PROC_PIDTASKALLINFO, 0, &taskInfo, PROC_PIDTASKALLINFO_SIZE)
@@ -549,6 +528,10 @@ nlohmann::json SysInfo::getUsers() const
     SudoersProvider sudoersProvider;
     auto collectedSudoers = sudoersProvider.collect();
 
+    // The User_Alias map does not depend on the user either, so build it once for the whole scan
+    // instead of re-parsing it inside isUserSudoer() for every account.
+    auto sudoersUserAliases = SudoersProvider::collectUserAliases(collectedSudoers);
+
     UserGroupsProvider userGroupsProvider;
 
     for (auto& user : collectedUsers)
@@ -569,6 +552,9 @@ nlohmann::json SysInfo::getUsers() const
         std::set<uid_t> uid {static_cast<uid_t>(user["uid"].get<int>())};
         auto collectedUsersGroups = userGroupsProvider.getGroupNamesByUid(uid);
 
+        // The sudoers lookup needs the group names one by one, not concatenated.
+        std::set<std::string> userGroupNames;
+
         if (collectedUsersGroups.empty())
         {
             userItem["user_groups"] = UNKNOWN_VALUE;
@@ -584,7 +570,9 @@ nlohmann::json SysInfo::getUsers() const
                     accumGroups += secondaryArraySeparator;
                 }
 
-                accumGroups += group.get<std::string>();
+                const auto groupName = group.get<std::string>();
+                accumGroups += groupName;
+                userGroupNames.insert(groupName);
             }
 
             userItem["user_groups"] = accumGroups;
@@ -613,9 +601,6 @@ nlohmann::json SysInfo::getUsers() const
         //TODO: Avoid this iteration, move logic to LoggedInUsersProvider
         for (auto& item : collectedLoggedInUser)
         {
-            // By default, user is not logged in.
-            userItem["login_status"] = 0;
-
             // tty,host,time and pid can take more than one value due to different logins.
             if (item["user"] == username)
             {
@@ -653,28 +638,28 @@ nlohmann::json SysInfo::getUsers() const
             userItem["user_last_login"] = 0;
         }
 
-        userItem["user_password_expiration_date"] = 0;
-        userItem["user_password_hash_algorithm"] = UNKNOWN_VALUE;
-        userItem["user_password_inactive_days"] = 0;
-        userItem["user_password_max_days_between_changes"] = 0;
-        userItem["user_password_min_days_between_changes"] = 0;
-        userItem["user_password_status"] = UNKNOWN_VALUE;
-        userItem["user_password_warning_days_before_expiration"] = 0;
+        userItem["user_password_hash_algorithm"] = user["password_hash_algorithm"];
+        userItem["user_password_status"] = user["password_status"];
+        // macOS has no shadow file. The only aging policy it can hold is a pwpolicy/MDM-imposed
+        // change interval, which is where expiration_date and max_days_between_changes come from
+        // when present. macOS has no equivalent of a minimum password age or of a warning period
+        // before expiration, so those two stay not collected rather than a guessed zero.
+        userItem["user_password_expiration_date"] = user.contains("password_expiration_date")
+                                                    ? user["password_expiration_date"]
+                                                    : nlohmann::json(NOT_COLLECTED_VALUE);
+        userItem["user_password_inactive_days"] = NOT_COLLECTED_VALUE;
+        userItem["user_password_max_days_between_changes"] = user.contains("password_max_days_between_changes")
+                                                             ? user["password_max_days_between_changes"]
+                                                             : nlohmann::json(NOT_COLLECTED_VALUE);
+        userItem["user_password_min_days_between_changes"] = NOT_COLLECTED_VALUE;
+        userItem["user_password_warning_days_before_expiration"] = NOT_COLLECTED_VALUE;
 
-        // By default, user is not sudoer.
         userItem["user_roles"] = UNKNOWN_VALUE;
 
-        for (auto& singleSudoer : collectedSudoers)
+        if (SudoersProvider::isUserSudoer(collectedSudoers, username, userGroupNames, sudoersUserAliases))
         {
-            // Searching in content of header
-            auto header = singleSudoer["header"].get<std::string>();
-
-            if (header.find(username) != std::string::npos)
-            {
-                //TODO: user_roles_sudo_sudo_rule_details has more detailed information.
-                userItem["user_roles"] = "sudo";
-
-            }
+            //TODO: user_roles_sudo_sudo_rule_details has more detailed information.
+            userItem["user_roles"] = "sudo";
         }
 
         result.push_back(std::move(userItem));
@@ -833,7 +818,14 @@ nlohmann::json SysInfo::getBrowserExtensions() const
 
             result.push_back(std::move(extensionItem));
         }
+    }
+    catch (const std::exception&)
+    {
+        // Keep collecting the remaining browsers
+    }
 
+    try
+    {
         // Collect Safari extensions
         SafariExtensionsProvider safariProvider;
         auto collectedSafariExtensions = safariProvider.collect();
@@ -867,7 +859,14 @@ nlohmann::json SysInfo::getBrowserExtensions() const
 
             result.push_back(std::move(extensionItem));
         }
+    }
+    catch (const std::exception&)
+    {
+        // Keep collecting the remaining browsers
+    }
 
+    try
+    {
         // Collect Firefox extensions
         FirefoxAddonsProvider firefoxProvider;
         auto collectedFirefoxExtensions = firefoxProvider.collect();

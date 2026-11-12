@@ -2,44 +2,19 @@
 # Created by Wazuh, Inc. <info@wazuh.com>.
 # This program is a free software; you can redistribute it and/or modify it under the terms of GPLv2
 
+import logging
+
 from connexion.lifecycle import ConnexionRequest, ConnexionResponse
 from connexion import exceptions
 
 import jwt
 from content_size_limit_asgi.errors import ContentSizeExceeded
 
-from api import configuration
-from api.middlewares import ip_block, ip_stats, ip_lock, LOGIN_ENDPOINT, RUN_AS_LOGIN_ENDPOINT
-from api.api_exception import BlockedIPException, MaxRequestsException, ExpectFailedException
+from api.middlewares import LOGIN_ENDPOINT, RUN_AS_LOGIN_ENDPOINT
+from api.api_exception import MaxRequestsException, ExpectFailedException
 from api.controllers.util import json_response, build_recursion_error_response, ERROR_CONTENT_TYPE
-from wazuh.core.utils import get_utc_now
 
-
-async def prevent_bruteforce_attack(request: ConnexionRequest, attempts: int = 5):
-    """Check that the IPs that are requesting an API token do not do so repeatedly.
-
-    Parameters
-    ----------
-    request : ConnexionRequest
-        HTTP request.
-    attempts : int
-        Number of attempts until an IP is blocked.
-    """
-
-    if request.scope['path'] in {LOGIN_ENDPOINT, RUN_AS_LOGIN_ENDPOINT} and \
-            request.method in {'GET', 'POST'}:
-        host = request.client.host
-
-        async with ip_lock:
-            if host not in ip_stats:
-                ip_stats[host] = dict()
-                ip_stats[host]['attempts'] = 1
-                ip_stats[host]['timestamp'] = get_utc_now().timestamp()
-            else:
-                ip_stats[host]['attempts'] += 1
-
-            if ip_stats[host]['attempts'] >= attempts:
-                ip_block.add(host)
+logger = logging.getLogger('wazuh-api')
 
 
 def _cleanup_detail_field(detail: str) -> str:
@@ -103,11 +78,6 @@ async def unauthorized_error_handler(request: ConnexionRequest,
     if request.scope['path'] in {LOGIN_ENDPOINT, RUN_AS_LOGIN_ENDPOINT} and \
         request.method in {'GET', 'POST'}:
         problem["detail"] = "Invalid credentials"
-
-        await prevent_bruteforce_attack(
-            request=request,
-            attempts=configuration.api_conf['access']['max_login_attempts']
-        )
     else:
         problem.update({'detail': exc.detail} \
                             if 'token_info' not in request.context \
@@ -190,9 +160,17 @@ async def content_size_handler(request: ConnexionRequest, exc: ContentSizeExceed
     Response
         Returns status code 413 if the maximum upload file size is exceeded.
     """
+    # The access log records this request like any other, so without a line naming the limit an
+    # operator sees a bare 413 and no way to tell which setting refused it.
+    logger.warning(f"Rejected a request to {request.scope.get('path', '')}: {exc}")
+
+    # Same body as the ceiling `CheckExpectHeaderMiddleware` answers with, so a caller sees one
+    # shape for 413 whether the limit was crossed at the header or while the body was being read.
+    # It is also the shape `RequestTooLargeResponse` publishes in spec.yaml.
     problem = {
-        "title": "Content size exceeded.",
-        "detail": str(exc)
+        "title": "Request Entity Too Large",
+        "detail": str(exc),
+        "error": 413
     }
     return json_response(data=problem, pretty=request.query_params.get('pretty', 'false') == 'true',
                          status_code=413, content_type=ERROR_CONTENT_TYPE)

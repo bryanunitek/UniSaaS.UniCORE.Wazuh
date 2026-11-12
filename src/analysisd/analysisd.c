@@ -66,6 +66,7 @@ int DecodeCiscat(Eventinfo *lf, int *socket);
 int DecodeWinevt(Eventinfo *lf);
 int DecodeSCA(Eventinfo *lf, int *socket);
 void DispatchDBSync(dbsync_context_t * ctx, Eventinfo * lf);
+void DispatchUpgradeModule(Eventinfo * lf);
 
 // Init sdb and decoder struct
 void sdb_init(_sdb *localsdb, OSDecoderInfo *fim_decoder);
@@ -520,6 +521,8 @@ int main_analysisd(int argc, char **argv)
         merror_exit(SETGID_ERROR, group, errno, strerror(errno));
     }
 
+    w_rule_tree_read_config();
+
     /* Chroot */
     if (Privsep_Chroot(home_path) < 0) {
         merror_exit(CHROOT_ERROR, home_path, errno, strerror(errno));
@@ -712,6 +715,10 @@ int main_analysisd(int argc, char **argv)
                 OSListNode * node_log_msg;
                 int error_exit = 0;
 
+                w_rule_tree_build_t rule_tree_build;
+                /* list_msg is written to the log after each file: the warning is logged directly */
+                w_rule_tree_build_init(&rule_tree_build, NULL);
+
                 char **rulesfiles;
                 rulesfiles = Config.includes;
                 while (rulesfiles && *rulesfiles) {
@@ -721,7 +728,7 @@ int main_analysisd(int argc, char **argv)
 
                     if (Rules_OP_ReadRules(*rulesfiles, &os_analysisd_rulelist,
                                            &os_analysisd_cdblists, &os_analysisd_last_events,
-                                           &os_analysisd_decoder_store, list_msg, true) < 0) {
+                                           &os_analysisd_decoder_store, list_msg, true, &rule_tree_build) < 0) {
                         error_exit = 1;
                     }
 
@@ -848,6 +855,9 @@ int main_analysisd(int argc, char **argv)
     pthread_rwlock_init(&g_hotreload_ruleset_mutex, &rwlock_attr);
     pthread_rwlockattr_destroy(&rwlock_attr);
 
+    /* Load the logtest config before the socket that serves it (getconfig) is published */
+    w_logtest_init_parameters();
+
     // Start com request thread
     w_create_thread(asyscom_main, NULL);
 
@@ -912,7 +922,7 @@ void OS_ReadMSG_analysisd(int m_queue)
 
 #ifndef LOCAL
         if (Config.ar & REMOTE_AR) {
-            if ((arq = StartMQ(ARQUEUE, WRITE, 1)) < 0) {
+            if ((arq = connect_exec_queue(ARQUEUE)) < 0) {
                 merror(ARQ_ERROR);
             } else {
                 minfo(CONN_TO, ARQUEUE, "active-response");
@@ -921,7 +931,7 @@ void OS_ReadMSG_analysisd(int m_queue)
 #endif
 
         if (Config.ar & LOCAL_AR) {
-            if ((execdq = StartMQ(EXECQUEUE, WRITE, 1)) < 0) {
+            if ((execdq = connect_exec_queue(EXECQUEUE)) < 0) {
                 merror(ARQ_ERROR);
             } else {
                 minfo(CONN_TO, EXECQUEUE, "exec");
@@ -1947,41 +1957,57 @@ void * w_dispatch_upgrade_module_thread(__attribute__((unused)) void * args) {
 
             w_inc_modules_upgrade_decoded_events(lf->agent_id);
 
-            // Inserts agent id into incomming message and sends it to upgrade module
-            cJSON *message_obj = cJSON_Parse(lf->log);
-
-            if (message_obj) {
-                cJSON *message_params = cJSON_GetObjectItem(message_obj, "parameters");
-
-                if (message_params) {
-                    int sock = OS_ConnectUnixDomain(WM_UPGRADE_SOCK, SOCK_STREAM, OS_MAXSTR);
-
-                    if (sock == OS_SOCKTERR) {
-                        merror("Could not connect to upgrade module socket at '%s'. Error: %s", WM_UPGRADE_SOCK, strerror(errno));
-                    } else {
-                        int agent = atoi(lf->agent_id);
-                        cJSON* agents = cJSON_CreateIntArray(&agent, 1);
-                        cJSON_AddItemToObject(message_params, "agents", agents);
-
-                        char *message = cJSON_PrintUnformatted(message_obj);
-                        OS_SendSecureTCP(sock, strlen(message), message);
-                        os_free(message);
-
-                        close(sock);
-                    }
-                } else {
-                    merror("Could not get parameters from upgrade message: %s", lf->log);
-                }
-                cJSON_Delete(message_obj);
-            } else {
-                merror("Could not parse upgrade message: %s", lf->log);
-            }
+            DispatchUpgradeModule(lf);
 
             Free_Eventinfo(lf);
         }
     }
 
     return NULL;
+}
+
+// Inserts agent id into incomming message and sends it to upgrade module
+void DispatchUpgradeModule(Eventinfo * lf) {
+    cJSON *message_obj = cJSON_Parse(lf->log);
+
+    if (message_obj) {
+        cJSON *message_command = cJSON_GetObjectItem(message_obj, "command");
+        cJSON *message_params = cJSON_GetObjectItem(message_obj, "parameters");
+
+        // Agents may only report their own upgrade status; any other command
+        // (e.g. "upgrade", "upgrade_custom") must come from the management API,
+        // never from the agent-message channel.
+        if (!message_command || message_command->type != cJSON_String ||
+            strcmp(message_command->valuestring, "upgrade_update_status") != 0) {
+            mdebug1("Agent '%s' is not allowed to request the upgrade command received on the agent channel", lf->agent_id);
+        } else if (message_params) {
+            int sock = OS_ConnectUnixDomain(WM_UPGRADE_SOCK, SOCK_STREAM, OS_MAXSTR);
+
+            if (sock == OS_SOCKTERR) {
+                merror("Could not connect to upgrade module socket at '%s'. Error: %s", WM_UPGRADE_SOCK, strerror(errno));
+            } else {
+                int agent = atoi(lf->agent_id);
+                cJSON* agents = cJSON_CreateIntArray(&agent, 1);
+
+                // Drop any "agents" key the sender supplied: lookups return the first match, so it would beat ours.
+                while (cJSON_GetObjectItem(message_params, "agents")) {
+                    cJSON_DeleteItemFromObject(message_params, "agents");
+                }
+                cJSON_AddItemToObject(message_params, "agents", agents);
+
+                char *message = cJSON_PrintUnformatted(message_obj);
+                OS_SendSecureTCP(sock, strlen(message), message);
+                os_free(message);
+
+                close(sock);
+            }
+        } else {
+            merror("Could not get parameters from upgrade message: %s", lf->log);
+        }
+        cJSON_Delete(message_obj);
+    } else {
+        merror("Could not parse upgrade message: %s", lf->log);
+    }
 }
 
 void * w_process_event_thread(__attribute__((unused)) void * id){
@@ -2672,10 +2698,12 @@ w_hotreload_ruleset_data_t * w_hotreload_create_ruleset(OSList * list_msg) {
     /* Load rules */
     {
         char ** files = ruleset_config.includes;
+        w_rule_tree_build_t rule_tree_build;
+        w_rule_tree_build_init(&rule_tree_build, list_msg);
 
         while (files != NULL && *files != NULL) {
             if (Rules_OP_ReadRules(*files, &ruleset->rule_list, &ruleset->cdblistnode, &ruleset->eventlist,
-                                   &ruleset->decoder_store, list_msg, true) < 0) {
+                                   &ruleset->decoder_store, list_msg, true, &rule_tree_build) < 0) {
                 w_hotreload_clean_ruleset(&ruleset);
                 return NULL;
             }

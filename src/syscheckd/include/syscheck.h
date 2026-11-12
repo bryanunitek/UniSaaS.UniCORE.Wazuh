@@ -24,6 +24,7 @@
 /* Audit defs */
 #define WDATA_DEFAULT_INTERVAL_SCAN 300
 #define AUDIT_SOCKET                "queue/sockets/audit"
+#define MAX_CONN_RETRIES            5          // Max retries to reconnect to Audit socket
 #define AUDIT_CONF_FILE             "tmp/af_wazuh.conf"
 #define AUDIT_HEALTHCHECK_DIR       "tmp"
 #define AUDIT_HEALTHCHECK_KEY       "wazuh_hc"
@@ -98,6 +99,7 @@ typedef struct diff_data {
 
     char *tmp_folder;
     char *file_origin;
+    char *new_file;
     char *uncompress_file;
     char *compress_tmp_file;
     char *diff_file;
@@ -540,11 +542,24 @@ void audit_rules_to_realtime();
 int set_auditd_config(void);
 
 /**
+ * @brief Removes the Audit plugin configuration file, if present.
+ */
+void audit_remove_plugin_config(void);
+
+/**
  * @brief Initialize Audit evsents socket
  *
  * @return File descriptor of the socket, -1 on error
  */
 int init_auditd_socket(void);
+
+/**
+ * @brief Reconnect to the Auditd socket, retrying up to MAX_CONN_RETRIES times
+ *
+ * @param audit_sock Output: file descriptor of the reconnected socket, -1 on failure
+ * @return File descriptor of the socket, -1 on error
+ */
+int audit_reconnect_with_retries(int *audit_sock);
 
 /**
  * @brief Reloads audit rules every RELOAD_RULES_INTERVAL seconds
@@ -881,7 +896,7 @@ void fim_send_scan_info(fim_scan_event event);
  * @brief Checks the DB state, sends a message alert if necessary
  *
  */
-void fim_check_db_state();
+void fim_check_db_state(int nodes_limit, int nodes_count, fim_state_db* db_state, const char* table_name);
 
 /**
  * @brief Checks the size of the queue/diff/local folder

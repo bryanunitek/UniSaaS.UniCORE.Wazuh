@@ -65,6 +65,9 @@ int main(int argc, char **argv)
 
     run_foreground = 0;
 
+    /* Must precede any other OpenSSL init: NO_ATEXIT keeps OPENSSL_cleanup() out of exit(), where it races with worker threads */
+    OPENSSL_init_crypto(OPENSSL_INIT_ADD_ALL_CIPHERS | OPENSSL_INIT_ADD_ALL_DIGESTS | OPENSSL_INIT_LOAD_CONFIG | OPENSSL_INIT_NO_ATEXIT, NULL);
+
     /* Set the name */
     OS_SetName(ARGV0);
 
@@ -177,6 +180,9 @@ int main(int argc, char **argv)
     if (!agt) {
         merror_exit(MEM_ERROR, errno, strerror(errno));
     }
+    /* calloc() only zeroes agt->sock.data; the embedded pthread_mutex_t must
+     * be initialized for real before any atomic_int_get/set(&agt->sock) call. */
+    w_mutex_init(&agt->sock.mutex, NULL);
 
     atc = (anti_tampering *)calloc(1, sizeof(anti_tampering));
     if (!atc) {
@@ -214,7 +220,9 @@ int main(int argc, char **argv)
         mlerror_exit(LOGLEVEL_ERROR, CLIENT_ERROR);
     }
 
-    if (!Validate_IPv6_Link_Local_Interface(agt->server)){
+    /* Resolve the server address only when the process won't fork: on macOS 26, getaddrinfo() crashed
+     * in the forked agent when this process had already called it. wazuh-control runs -t before starting */
+    if ((test_config || run_foreground) && !Validate_IPv6_Link_Local_Interface(agt->server)){
         merror(AG_INV_INT);
         mlerror_exit(LOGLEVEL_ERROR, CLIENT_ERROR);
     }

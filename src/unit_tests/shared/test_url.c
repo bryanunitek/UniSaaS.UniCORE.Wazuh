@@ -16,6 +16,25 @@
 #include "../headers/shared.h"
 #include "../wrappers/common.h"
 #include "../wrappers/wazuh/shared/file_op_wrappers.h"
+#include "../wrappers/wazuh/os_net/os_net_wrappers.h"
+
+#if LIBCURL_VERSION_NUM >= 0x075500
+#define EXPECTED_PROTOCOLS_OPT CURLOPT_PROTOCOLS_STR
+#else
+#define EXPECTED_PROTOCOLS_OPT CURLOPT_PROTOCOLS
+#endif
+
+#ifndef TEST_WINAGENT
+ssize_t __wrap_send(__attribute__((unused)) int sockfd, const void *buf, size_t len, __attribute__((unused)) int flags) {
+    check_expected(buf);
+    return len;
+}
+
+ssize_t __wrap_recv(__attribute__((unused)) int sockfd, void *buf, __attribute__((unused)) size_t len, __attribute__((unused)) int flags) {
+    memcpy(buf, "ok", 2);
+    return 2;
+}
+#endif
 
 /* setup/teardown */
 static int group_setup(void ** state) {
@@ -217,6 +236,10 @@ void test_wurl_http_request_curl_easy_perform_fail_with_headers(void **state)
         expect_value(wrap_curl_easy_setopt, curl, curl);
         will_return(wrap_curl_easy_setopt, CURLE_OK);
 
+        expect_value(wrap_curl_easy_setopt, option, EXPECTED_PROTOCOLS_OPT);
+        expect_value(wrap_curl_easy_setopt, curl, curl);
+        will_return(wrap_curl_easy_setopt, CURLE_OK);
+
         expect_value(wrap_curl_easy_perform, curl, curl);
         will_return(wrap_curl_easy_perform, (CURLcode) 9);
 
@@ -260,6 +283,10 @@ void test_wurl_http_request_curl_easy_perform_fail_with_headers(void **state)
         will_return(__wrap_curl_easy_setopt, CURLE_OK);
 
         expect_value(__wrap_curl_easy_setopt, option, CURLOPT_URL);
+        expect_value(__wrap_curl_easy_setopt, curl, curl);
+        will_return(__wrap_curl_easy_setopt, CURLE_OK);
+
+        expect_value(__wrap_curl_easy_setopt, option, EXPECTED_PROTOCOLS_OPT);
         expect_value(__wrap_curl_easy_setopt, curl, curl);
         will_return(__wrap_curl_easy_setopt, CURLE_OK);
 
@@ -322,6 +349,10 @@ void test_wurl_http_request_curl_easy_perform_fail_with_payload(void **state)
         expect_value(wrap_curl_easy_setopt, curl, curl);
         will_return(wrap_curl_easy_setopt, CURLE_OK);
 
+        expect_value(wrap_curl_easy_setopt, option, EXPECTED_PROTOCOLS_OPT);
+        expect_value(wrap_curl_easy_setopt, curl, curl);
+        will_return(wrap_curl_easy_setopt, CURLE_OK);
+
         expect_value(wrap_curl_easy_setopt, option, CURLOPT_POSTFIELDS);
         expect_value(wrap_curl_easy_setopt, curl, curl);
         will_return(wrap_curl_easy_setopt, CURLE_OK);
@@ -365,6 +396,10 @@ void test_wurl_http_request_curl_easy_perform_fail_with_payload(void **state)
         will_return(__wrap_curl_easy_setopt, CURLE_OK);
 
         expect_value(__wrap_curl_easy_setopt, option, CURLOPT_URL);
+        expect_value(__wrap_curl_easy_setopt, curl, curl);
+        will_return(__wrap_curl_easy_setopt, CURLE_OK);
+
+        expect_value(__wrap_curl_easy_setopt, option, EXPECTED_PROTOCOLS_OPT);
         expect_value(__wrap_curl_easy_setopt, curl, curl);
         will_return(__wrap_curl_easy_setopt, CURLE_OK);
 
@@ -431,6 +466,10 @@ void test_wurl_http_request_curl_easy_perform_fail_timeout(void **state)
         expect_value(wrap_curl_easy_setopt, curl, curl);
         will_return(wrap_curl_easy_setopt, CURLE_OK);
 
+        expect_value(wrap_curl_easy_setopt, option, EXPECTED_PROTOCOLS_OPT);
+        expect_value(wrap_curl_easy_setopt, curl, curl);
+        will_return(wrap_curl_easy_setopt, CURLE_OK);
+
         expect_value(wrap_curl_easy_setopt, option, CURLOPT_POSTFIELDS);
         expect_value(wrap_curl_easy_setopt, curl, curl);
         will_return(wrap_curl_easy_setopt, CURLE_OK);
@@ -478,6 +517,10 @@ void test_wurl_http_request_curl_easy_perform_fail_timeout(void **state)
         will_return(__wrap_curl_easy_setopt, CURLE_OK);
 
         expect_value(__wrap_curl_easy_setopt, option, CURLOPT_URL);
+        expect_value(__wrap_curl_easy_setopt, curl, curl);
+        will_return(__wrap_curl_easy_setopt, CURLE_OK);
+
+        expect_value(__wrap_curl_easy_setopt, option, EXPECTED_PROTOCOLS_OPT);
         expect_value(__wrap_curl_easy_setopt, curl, curl);
         will_return(__wrap_curl_easy_setopt, CURLE_OK);
 
@@ -547,6 +590,10 @@ void test_wurl_http_request_curl_easy_setopt_fail(void **state)
         expect_value(wrap_curl_easy_setopt, curl, curl);
         will_return(wrap_curl_easy_setopt, CURLE_OK);
 
+        expect_value(wrap_curl_easy_setopt, option, EXPECTED_PROTOCOLS_OPT);
+        expect_value(wrap_curl_easy_setopt, curl, curl);
+        will_return(wrap_curl_easy_setopt, CURLE_OK);
+
         expect_value(wrap_curl_easy_setopt, option, CURLOPT_POSTFIELDS);
         expect_value(wrap_curl_easy_setopt, curl, curl);
         will_return(wrap_curl_easy_setopt, (CURLcode) 49);
@@ -587,6 +634,10 @@ void test_wurl_http_request_curl_easy_setopt_fail(void **state)
         will_return(__wrap_curl_easy_setopt, CURLE_OK);
 
         expect_value(__wrap_curl_easy_setopt, option, CURLOPT_URL);
+        expect_value(__wrap_curl_easy_setopt, curl, curl);
+        will_return(__wrap_curl_easy_setopt, CURLE_OK);
+
+        expect_value(__wrap_curl_easy_setopt, option, EXPECTED_PROTOCOLS_OPT);
         expect_value(__wrap_curl_easy_setopt, curl, curl);
         will_return(__wrap_curl_easy_setopt, CURLE_OK);
 
@@ -650,6 +701,10 @@ void test_wurl_http_request_success(void **state)
         expect_value(wrap_curl_easy_setopt, curl, curl);
         will_return(wrap_curl_easy_setopt, CURLE_OK);
 
+        expect_value(wrap_curl_easy_setopt, option, EXPECTED_PROTOCOLS_OPT);
+        expect_value(wrap_curl_easy_setopt, curl, curl);
+        will_return(wrap_curl_easy_setopt, CURLE_OK);
+
         expect_value(wrap_curl_easy_setopt, option, CURLOPT_USERPWD);
         expect_value(wrap_curl_easy_setopt, curl, curl);
         will_return(wrap_curl_easy_setopt, CURLE_OK);
@@ -705,6 +760,10 @@ void test_wurl_http_request_success(void **state)
         expect_value(__wrap_curl_easy_setopt, curl, curl);
         will_return(__wrap_curl_easy_setopt, CURLE_OK);
 
+        expect_value(__wrap_curl_easy_setopt, option, EXPECTED_PROTOCOLS_OPT);
+        expect_value(__wrap_curl_easy_setopt, curl, curl);
+        will_return(__wrap_curl_easy_setopt, CURLE_OK);
+
         expect_value(__wrap_curl_easy_setopt, option, CURLOPT_USERPWD);
         expect_value(__wrap_curl_easy_setopt, curl, curl);
         will_return(__wrap_curl_easy_setopt, CURLE_OK);
@@ -731,6 +790,34 @@ void test_wurl_http_request_success(void **state)
     os_free(response);
 }
 
+#ifndef TEST_WINAGENT
+// Test wurl_request
+void test_wurl_request_escape_delimiter(void **state)
+{
+    expect_string(__wrap_OS_ConnectUnixDomain, path, WM_DOWNLOAD_SOCK);
+    expect_value(__wrap_OS_ConnectUnixDomain, type, SOCK_STREAM);
+    expect_value(__wrap_OS_ConnectUnixDomain, max_msg_size, OS_MAXSTR);
+    will_return(__wrap_OS_ConnectUnixDomain, 4);
+
+    expect_string(__wrap_send, buf, "download http://host/a%7Cb%7Cc%20d|var/download/x\\|y|H\\|1|d\\|2|5|");
+
+    assert_int_equal(wurl_request("http://host/a|b|c d", "var/download/x|y", "H|1", "d|2", 5), 0);
+}
+
+// The escape character of the URL must not be able to hide the delimiter
+void test_wurl_request_encode_url_escape_char(void **state)
+{
+    expect_string(__wrap_OS_ConnectUnixDomain, path, WM_DOWNLOAD_SOCK);
+    expect_value(__wrap_OS_ConnectUnixDomain, type, SOCK_STREAM);
+    expect_value(__wrap_OS_ConnectUnixDomain, max_msg_size, OS_MAXSTR);
+    will_return(__wrap_OS_ConnectUnixDomain, 4);
+
+    expect_string(__wrap_send, buf, "download http://host/a%5C%7Cb%5C|var/download/f|||0|");
+
+    assert_int_equal(wurl_request("http://host/a\\|b\\", "var/download/f", NULL, NULL, 0), 0);
+}
+#endif
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -744,6 +831,11 @@ int main(void)
         cmocka_unit_test(test_wurl_http_request_curl_easy_perform_fail_timeout),
         cmocka_unit_test(test_wurl_http_request_curl_easy_setopt_fail),
         cmocka_unit_test(test_wurl_http_request_success),
+#ifndef TEST_WINAGENT
+        // Tests wurl_request
+        cmocka_unit_test(test_wurl_request_escape_delimiter),
+        cmocka_unit_test(test_wurl_request_encode_url_escape_char),
+#endif
     };
 
     return cmocka_run_group_tests(tests, group_setup, group_teardown);

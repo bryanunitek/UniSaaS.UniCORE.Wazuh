@@ -4,7 +4,8 @@
 
 import json
 import os
-from unittest.mock import patch
+import regex
+from unittest.mock import patch, MagicMock
 
 import pytest
 from sqlalchemy import create_engine
@@ -104,3 +105,148 @@ def test_auth_roles(db_setup):
                     else:
                         assert len(test.get_user_roles()) == 0
         roles = values()[1]
+
+
+def _make_checker(auth_context=None):
+    """Return an RBAChecker with no DB interaction."""
+    # Imported lazily (not at module scope) so collecting this file does not import
+    # wazuh.rbac.orm before sibling tests that reload it under patched engines; a
+    # module-level import leaves a stale orm reference and breaks test_auth_roles.
+    from wazuh.rbac.auth_context import RBAChecker
+    with patch('wazuh.rbac.auth_context.orm.RolesManager') as mock_rm, \
+         patch('wazuh.rbac.auth_context.orm.RulesManager'):
+        mock_rm.return_value.__enter__.return_value.get_roles.return_value = []
+        return RBAChecker(auth_context=auth_context or {})
+
+
+def test_find_item_depth_limit_raises():
+    """find_item must raise AuthContextDepthExceeded when nesting exceeds MAX_FIND_ITEM_DEPTH."""
+    from wazuh.rbac.auth_context import AuthContextDepthExceeded, MAX_FIND_ITEM_DEPTH
+    checker = _make_checker()
+    # Build a dict nested one level deeper than the allowed maximum
+    deep = {"leaf": "value"}
+    for _ in range(MAX_FIND_ITEM_DEPTH + 1):
+        deep = {"level": deep}
+
+    with pytest.raises(AuthContextDepthExceeded):
+        checker.find_item({"leaf": "value"}, auth_context=deep, mode='FIND')
+
+
+def test_get_user_roles_denies_when_depth_exceeded():
+    """get_user_roles must not grant a role when find_item hits the depth limit.
+
+    A NOT+FIND rule would incorrectly grant access if the truncated search returned
+    False (no match found), because NOT(False) evaluates to True. Raising
+    AuthContextDepthExceeded instead causes get_user_roles to skip the role entirely.
+    """
+    from wazuh.rbac.auth_context import MAX_FIND_ITEM_DEPTH
+    deep = {"leaf": "value"}
+    for _ in range(MAX_FIND_ITEM_DEPTH + 1):
+        deep = {"level": deep}
+    checker = _make_checker(auth_context=deep)
+    checker.user_id = 2
+    checker.roles_list = [{"id": 1, "rules": [{"id": 1, "rule": {"NOT": [{"FIND": {"leaf": "value"}}]}}]}]
+
+    assert checker.get_user_roles() == []
+
+
+def test_process_lists_handles_regex_timeout():
+    """process_lists must not propagate a regex timeout; it should skip and continue."""
+    checker = _make_checker()
+    fake_pattern = MagicMock()
+    fake_pattern.fullmatch.side_effect = TimeoutError('regex timed out')
+    with patch.object(checker, 'check_regex', return_value=fake_pattern):
+        result = checker.process_lists(["ignored"], ["anything"], 'MATCH')
+    assert result == 0
+
+
+def test_match_item_survives_catastrophic_backtracking():
+    """match_item must not hang or raise when a role regex causes catastrophic backtracking.
+
+    (a|a)+$ against a string of 'a's with no terminating match is a classic ReDoS pattern;
+    without the timeout it would hang for minutes. check_regex is patched to bypass the
+    'r\\'...\\'' marker parsing so this test exercises the timeout handling directly, not the
+    marker string slicing.
+    """
+    checker = _make_checker()
+    evil_pattern = regex.compile(r'(a|a)+$')
+    evil_input = "a" * 30 + "!"  # never matches; triggers exponential backtracking
+    with patch.object(checker, 'check_regex', return_value=evil_pattern):
+        result = checker.match_item("irrelevant", [evil_input], 'MATCH')
+    assert result in (0, False)
+
+
+def test_check_regex_keeps_trailing_anchor():
+    """check_regex must strip only the closing quote, keeping the pattern's own trailing '$'."""
+    checker = _make_checker()
+    assert checker.check_regex(r"r'^admin$'").pattern == "^admin$"
+
+
+@pytest.mark.parametrize('candidate, expected', [
+    ('admin', 1),
+    ('administrator', 0),
+    ('admin-prod', 0),
+])
+def test_check_regex_rejects_prefix_extension(candidate, expected):
+    """A '$'-anchored rule must only match the exact value, not values extending it as a prefix."""
+    checker = _make_checker()
+    assert checker.match_item(r"r'^admin$'", [candidate], mode='MATCH') == expected
+
+
+def test_check_regex_requires_full_match_without_anchor():
+    """A rule regex without a trailing '$' must still match the whole value, not just a prefix."""
+    checker = _make_checker()
+    assert checker.match_item(r"r'^admin'", ["admin"], mode='MATCH') == 1
+    assert checker.match_item(r"r'^admin'", ["administrator"], mode='MATCH') == 0
+    assert checker.process_lists([r"r'^admin'"], ["administrator"], 'MATCH') == 0
+
+
+def test_match_item_regex_key_requires_full_match():
+    """A regex rule key must match the whole authorization-context key, not just a prefix of it."""
+    checker = _make_checker()
+    assert checker.match_item({"r'^auth$'": "x"}, {"auth": "x"}) == 1
+    assert checker.match_item({"r'^auth$'": "x"}, {"authx": "x"}) == 0
+    assert checker.match_item({"r'^auth'": "x"}, {"authx": "x"}) == 0
+
+
+def test_match_item_rejects_trailing_newline():
+    """`$` matches before a trailing newline, so only a full match rejects `admin\\n`."""
+    checker = _make_checker()
+    assert checker.match_item("r'^admin$'", "admin") == 1
+    assert checker.match_item("r'^admin$'", "admin\n") == 0
+    assert checker.match_item({"r'^auth$'": "x"}, {"auth\n": "x"}) == 0
+    assert checker.process_lists(["r'^admin$'"], ["admin\n"], "MATCH") == 0
+
+
+@pytest.mark.parametrize('expression', ["r'^a|b", "r'", "r'^admin$"])
+def test_check_regex_rejects_unterminated_expression(expression):
+    """A rule without its closing quote is not a regex and must not be compiled from a partial pattern."""
+    checker = _make_checker()
+    assert checker.check_regex(expression) is False
+    assert checker.match_item(expression, "") == 0
+    assert checker.process_lists([expression], [""], "MATCH") == 0
+
+
+@pytest.mark.parametrize('role_chunk, auth_chunk, mode, expected', [
+    # A rule item not satisfied by any value must not be compensated by another item matching twice
+    (["r'^team-.*$'", "admin"], ["team-a", "team-b"], 'MATCH', 0),
+    (["r'^team-.*$'", "admin"], ["team-a", "team-b"], 'MATCH$', 0),
+    (["admin", "x"], ["admin", "admin"], 'MATCH', 0),
+    (["admin", "x"], ["admin", "admin"], 'MATCH$', 0),
+    # Every rule item satisfied
+    (["r'^team-.*$'", "admin"], ["team-a", "admin"], 'MATCH', 1),
+    (["r'^team-.*$'", "admin"], ["team-a", "admin"], 'MATCH$', 1),
+    # An empty rule list grants nothing
+    ([], ["a"], 'MATCH', 0),
+    ([], ["a"], 'MATCH$', 0),
+    # MATCH$ needs as many context values as rule items
+    (["r'^team-.*$'"], ["team-a", "team-b"], 'MATCH$', 0),
+    (["admin"], ["admin", "admin"], 'MATCH$', 0),
+    # MATCH accepts extra context values, MATCH$ does not
+    (["admin"], ["admin", "other"], 'MATCH', 1),
+    (["admin"], ["admin", "other"], 'MATCH$', 0),
+])
+def test_process_lists_requires_every_rule_item(role_chunk, auth_chunk, mode, expected):
+    """Each item of the rule must be satisfied by some value, not just reach the same number of matches."""
+    checker = _make_checker()
+    assert checker.process_lists(role_chunk, auth_chunk, mode) == expected

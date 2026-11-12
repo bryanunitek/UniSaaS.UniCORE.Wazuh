@@ -44,6 +44,8 @@ public:
             if (event->cwd) free(event->cwd);
             if (event->audit_name) free(event->audit_name);
             if (event->audit_uid) free(event->audit_uid);
+            if (event->audit_gid) free(event->audit_gid);
+            if (event->audit_group_name) free(event->audit_group_name);
             if (event->effective_name) free(event->effective_name);
             if (event->effective_uid) free(event->effective_uid);
             if (event->group_id) free(event->group_id);
@@ -68,12 +70,8 @@ fimebpf::fim_whodata_event_t MockFimebpf::mock_fim_whodata_event = nullptr;
 fimebpf::loggingFunction_t MockFimebpf::mock_loggingFunction = nullptr;
 fimebpf::abspath_t MockFimebpf::mock_abspath = nullptr;
 
-directory_t* mock_fim_conf_failure([[maybe_unused]] const char* config_path) { return nullptr; }
-directory_t* mock_fim_conf_success([[maybe_unused]] const char* config_path) {
-    static directory_t mockDirectory;
-    mockDirectory.options = WHODATA_ACTIVE;
-    return &mockDirectory;
-}
+bool mock_fim_conf_failure([[maybe_unused]] const char* config_path) { return false; }
+bool mock_fim_conf_success([[maybe_unused]] const char* config_path) { return true; }
 char* mock_get_user([[maybe_unused]] int uid) { return strdup("mock_user"); }
 char* mock_get_group([[maybe_unused]] int gid) { return strdup("mock_group"); }
 void mock_fim_whodata_event([[maybe_unused]] whodata_evt* event) { return; }
@@ -95,6 +93,7 @@ bpf_program* mock_bpf_object_next_program_in([[maybe_unused]] void* obj, bpf_pro
 }
 int mock_bpf_program_attach_success([[maybe_unused]] void* prog) { return 1; }
 int mock_bpf_program_attach_failure([[maybe_unused]] void* prog) { return 0; }
+void mock_bpf_link_destroy([[maybe_unused]] struct bpf_link* link) {}
 int mock_bpf_program_set_autoload([[maybe_unused]] void* prog, [[maybe_unused]] bool autoload) { return 0; }
 bool mock_bpf_program_autoload_true([[maybe_unused]] const void* prog) { return true; }
 bool mock_bpf_program_autoload_false([[maybe_unused]] const void* prog) { return false; }
@@ -123,7 +122,6 @@ void mock_w_bpf_deinit([[maybe_unused]]void* helpers) {}
 int mock_init_ring_buffer_success([[maybe_unused]]ring_buffer** rb, [[maybe_unused]]ring_buffer_sample_fn sample_cb) { return 0; }
 int mock_init_ring_buffer_failure([[maybe_unused]]ring_buffer** rb, [[maybe_unused]]ring_buffer_sample_fn sample_cb) { return 1; }
 void mock_ebpf_pop_events() { return; }
-int mock_check_invalid_kernel_version() { return 0; }
 int mock_init_libbpf([[maybe_unused]]std::unique_ptr<DynamicLibraryWrapper> sym_load) { return 0; }
 int mock_init_bpfobj() { return 0; }
 

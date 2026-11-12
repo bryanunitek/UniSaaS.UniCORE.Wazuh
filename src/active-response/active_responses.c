@@ -28,7 +28,11 @@ static cJSON* get_srcip_from_win_eventdata(const cJSON *data);
 void write_debug_file(const char *ar_name, const char *msg) {
     char *timestamp = w_get_timestamp(time(NULL));
 
+#ifndef WIN32
+    FILE *ar_log_file = w_fopen_nofollow(AR_LOG_DIR, AR_LOG_FILE_NAME, "a");
+#else
     FILE *ar_log_file = wfopen(LOG_FILE, "a");
+#endif
 
     if (ar_log_file) {
         fprintf(ar_log_file, "%s %s: %s\n", timestamp, ar_name, msg);
@@ -250,12 +254,26 @@ const char* get_srcip_from_json(const cJSON *input) {
     // Detect srcip from win.eventdata
     srcip_json = get_srcip_from_win_eventdata(data_json);
     if (cJSON_IsString(srcip_json)) {
-        return srcip_json->valuestring;
+        const char *srcip = srcip_json->valuestring;
+
+        // Validate IP format
+        if (get_ip_version(srcip) == OS_INVALID) {
+            return NULL;
+        }
+
+        return srcip;
     }
     // Detect srcip from data
     srcip_json = cJSON_GetObjectItem(data_json, "srcip");
     if (cJSON_IsString(srcip_json)) {
-        return srcip_json->valuestring;
+        const char *srcip = srcip_json->valuestring;
+
+        // Validate IP format
+        if (get_ip_version(srcip) == OS_INVALID) {
+            return NULL;
+        }
+
+        return srcip;
     }
 
     return NULL;
@@ -293,6 +311,45 @@ static cJSON* get_srcip_from_win_eventdata(const cJSON *data) {
     return NULL;
 }
 
+// Accepts only the portable username character set, plus '$' anywhere for machine
+// accounts. Anything outside it is rejected, so no separator, quote, whitespace,
+// control or non-ASCII byte reaches the argument vector the username is placed in.
+// '@' is deliberately excluded: passwd and chuser act on local accounts, which
+// cannot carry a realm suffix, so a qualified name could never be locked anyway.
+int is_valid_username(const char *username) {
+    if (!username || !*username) {
+        return 0;
+    }
+
+    // Reject reserved names
+    if (strcmp(username, "root") == 0) {
+        return 0;
+    }
+
+    size_t len = strlen(username);
+
+    // Maximum username length (typical limit is 32, but we allow up to 256 for compatibility)
+    if (len > 256) {
+        return 0;
+    }
+
+    // A leading dash would be read as an option by the command the name is passed to
+    if (username[0] == '-') {
+        return 0;
+    }
+
+    for (size_t i = 0; i < len; i++) {
+        char c = username[i];
+
+        if (!(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') && !(c >= '0' && c <= '9') &&
+            c != '.' && c != '_' && c != '-' && c != '$') {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
 const char* get_username_from_json(const cJSON *input) {
     cJSON *parameters_json = NULL;
     cJSON *alert_json = NULL;
@@ -320,7 +377,14 @@ const char* get_username_from_json(const cJSON *input) {
     // Detect username
     username_json = cJSON_GetObjectItem(data_json, "dstuser");
     if (cJSON_IsString(username_json)) {
-        return username_json->valuestring;
+        const char *username = username_json->valuestring;
+
+        // Validate username format
+        if (!is_valid_username(username)) {
+            return NULL;
+        }
+
+        return username;
     }
 
     return NULL;
@@ -483,7 +547,93 @@ int isEnabledFromPattern(const char * output_buf, const char * str_pattern_1, co
     return retVal;
 }
 
+int get_ip_version(const char *ip) {
+    struct addrinfo hint, *res = NULL;
+    int ret;
+    int version = OS_INVALID;
+
+    if (!ip) {
+        return OS_INVALID;
+    }
+
+#ifdef WIN32
+    // Active-response binaries are short-lived processes that never call WSAStartup().
+    // Without it getaddrinfo() fails with WSANOTINITIALISED, so initialize Winsock here.
+    WSADATA wsaData;
+    int wsa_started = (WSAStartup(MAKEWORD(2, 2), &wsaData) == 0);
+#endif
+
+    memset(&hint, '\0', sizeof hint);
+
+    hint.ai_family = AF_UNSPEC;
+    hint.ai_flags = AI_NUMERICHOST;
+
+    ret = getaddrinfo(ip, NULL, &hint, &res);
+    if (ret != 0) {
+        // getaddrinfo failed, res may not be initialized
+#ifdef WIN32
+        if (wsa_started) {
+            WSACleanup();
+        }
+#endif
+        return OS_INVALID;
+    }
+
+    // getaddrinfo succeeded, check the address family
+    if (res != NULL) {
+        if (res->ai_family == AF_INET) {
+            version = 4;
+        } else if (res->ai_family == AF_INET6) {
+            version = 6;
+        }
+        freeaddrinfo(res);
+    }
+
+#ifdef WIN32
+    if (wsa_started) {
+        WSACleanup();
+    }
+#endif
+
+    return version;
+}
+
 #ifndef WIN32
+
+bool canonicalize_ip(const char *ip, char *output, size_t output_size) {
+    unsigned char addr[sizeof(struct in6_addr)];
+
+    if (!ip || !output || output_size == 0) {
+        return false;
+    }
+
+    // Strict parsing matching the manager's white_list grammar (inet_pton): octal, hex
+    // and short IPv4 forms are rejected instead of reinterpreted into a different host.
+    if (inet_pton(AF_INET, ip, addr) == 1) {
+        return inet_ntop(AF_INET, addr, output, output_size) != NULL;
+    }
+    if (inet_pton(AF_INET6, ip, addr) == 1) {
+        return inet_ntop(AF_INET6, addr, output, output_size) != NULL;
+    }
+
+    return false;
+}
+
+bool hosts_deny_rule_matches(const char *line, const char *rule) {
+    if (!line || !rule) {
+        return false;
+    }
+
+    // Match the exact Wazuh-managed rule, ignoring trailing EOL/whitespace, so an
+    // administrator line that merely contains the IP as a substring is never touched.
+    size_t len = strlen(line);
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r' ||
+                       line[len - 1] == ' ' || line[len - 1] == '\t')) {
+        len--;
+    }
+
+    return strlen(rule) == len && strncmp(line, rule, len) == 0;
+}
 
 int lock(const char *lock_path, const char *lock_pid_path, const char *log_path, const char *proc_name) {
     char log_msg[OS_MAXSTR];
@@ -623,29 +773,4 @@ void unlock(const char *lock_path, const char *log_path) {
     }
 }
 
-int get_ip_version(const char *ip) {
-    struct addrinfo hint, *res = NULL;
-    int ret;
-
-    memset(&hint, '\0', sizeof hint);
-
-    hint.ai_family = AF_UNSPEC;
-    hint.ai_flags = AI_NUMERICHOST;
-
-    ret = getaddrinfo(ip, NULL, &hint, &res);
-    if (ret) {
-        freeaddrinfo(res);
-        return OS_INVALID;
-    }
-    if (res->ai_family == AF_INET) {
-        freeaddrinfo(res);
-        return 4;
-    } else if (res->ai_family == AF_INET6) {
-        freeaddrinfo(res);
-        return 6;
-    }
-
-    freeaddrinfo(res);
-    return OS_INVALID;
-}
 #endif

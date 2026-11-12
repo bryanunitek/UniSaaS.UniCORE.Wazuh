@@ -10,10 +10,12 @@
 #ifndef BPF_HELPERS_H
 #define BPF_HELPERS_H
 
+#include <cstdarg>
 #include <dlfcn.h>
 #include <stdint.h>
+#include <string>
 #include "logging_helper.h"
-#include <bounded_queue.hpp>
+#include "bounded_queue.hpp"
 #include <memory>
 
 typedef __attribute__((aligned(4))) unsigned int __u32;
@@ -30,6 +32,8 @@ struct file_event {
     __u32 ppid;
     __u32 uid;
     __u32 gid;
+    __u32 euid;
+    __u32 login_uid;
     uint64_t inode;
     uint64_t dev;
     char comm[TASK_COMM_LEN];
@@ -49,6 +53,8 @@ struct dynamic_file_event {
     uint32_t ppid;
     uint32_t uid;
     uint32_t gid;
+    uint32_t euid;
+    uint32_t login_uid;
     uint64_t inode;
     uint64_t dev;
 };
@@ -78,22 +84,18 @@ typedef void (*ring_buffer__free_t)(struct ring_buffer *rb);
 typedef void (*bpf_object__close_t)(struct bpf_object *obj);
 typedef struct bpf_program *(*bpf_object__next_program_t)(const struct bpf_object *obj, struct bpf_program *prog);
 typedef struct bpf_link *(*bpf_program__attach_t)(struct bpf_program *prog);
+typedef int (*bpf_link__destroy_t)(struct bpf_link *link);
 typedef int (*bpf_object__find_map_fd_by_name_t)(struct bpf_object *obj, const char *name);
 typedef int (*bpf_program__set_autoload_t)(struct bpf_program *prog, bool autoload);
 typedef bool (*bpf_program__autoload_t)(const struct bpf_program *prog);
 typedef const char *(*bpf_program__section_name_t)(const struct bpf_program *prog);
 typedef const char *(*bpf_program__name_t)(const struct bpf_program *prog);
-
-// Function pointers to execute stateless requests to BPF
-void (*bpf_object__destroy_skeleton)(struct bpf_object_skeleton *obj) = NULL;
-int (*bpf_object__open_skeleton)(struct bpf_object_skeleton *obj, const struct bpf_object_open_opts *opts) = NULL;
-int (*bpf_object__load_skeleton)(struct bpf_object_skeleton *obj) = NULL;
-int (*bpf_object__attach_skeleton)(struct bpf_object_skeleton *obj) = NULL;
-void (*bpf_object__detach_skeleton)(struct bpf_object_skeleton *obj) = NULL;
+typedef int (*libbpf_print_fn_t)(int level, const char *format, va_list args);
+typedef libbpf_print_fn_t (*libbpf_set_print_t)(libbpf_print_fn_t fn);
 
 typedef int(*init_ring_buffer_t)(ring_buffer** rb, ring_buffer_sample_fn sample_cb);
 typedef void(*ebpf_pop_events_t)(fim::BoundedQueue<std::unique_ptr<dynamic_file_event>>& kernel_queue);
-typedef int(*check_invalid_kernel_version_t)();
+typedef bool(*is_bpf_lsm_active_t)();
 typedef int(*init_libbpf_t)(std::unique_ptr<DynamicLibraryWrapper> sym_load);
 typedef int(*init_bpfobj_t)();
 
@@ -112,11 +114,13 @@ typedef struct {
     bpf_object__close_t bpf_object_close;
     bpf_object__next_program_t bpf_object_next_program;
     bpf_program__attach_t bpf_program_attach;
+    bpf_link__destroy_t bpf_link_destroy;
     bpf_object__find_map_fd_by_name_t bpf_object_find_map_fd_by_name;
     bpf_program__set_autoload_t bpf_program_set_autoload;
     bpf_program__autoload_t bpf_program_autoload;
     bpf_program__section_name_t bpf_program_section_name;
     bpf_program__name_t bpf_program_name;
+    libbpf_set_print_t libbpf_set_print;
 
     bpf_object__open_skeleton_t bpf_object_open_skeleton;
     bpf_object__destroy_skeleton_t bpf_object_destroy_skeleton;
@@ -126,7 +130,7 @@ typedef struct {
 
     init_ring_buffer_t init_ring_buffer;
     ebpf_pop_events_t ebpf_pop_events;
-    check_invalid_kernel_version_t check_invalid_kernel_version;
+    is_bpf_lsm_active_t is_bpf_lsm_active;
     init_libbpf_t init_libbpf;
     init_bpfobj_t init_bpfobj;
 
@@ -141,54 +145,24 @@ typedef struct {
 
 
 inline bool w_bpf_deinit(std::unique_ptr<w_bpf_helpers_t>& bpf_helpers) {
-    bool result = false;
-
-    if (bpf_helpers) {
-        // Reset function pointers to NULL
-        bpf_helpers->bpf_object_open_file = NULL;
-        bpf_helpers->bpf_object_load = NULL;
-        bpf_helpers->ring_buffer_new = NULL;
-        bpf_helpers->ring_buffer_poll = NULL;
-        bpf_helpers->ring_buffer_free = NULL;
-        bpf_helpers->bpf_object_close = NULL;
-        bpf_helpers->bpf_object_next_program = NULL;
-        bpf_helpers->bpf_program_attach = NULL;
-        bpf_helpers->bpf_object_find_map_fd_by_name = NULL;
-        bpf_helpers->bpf_program_set_autoload = NULL;
-        bpf_helpers->bpf_program_autoload = NULL;
-        bpf_helpers->bpf_program_section_name = NULL;
-        bpf_helpers->bpf_program_name = NULL;
-
-        // Reset skeleton-specific function pointers to NULL
-        bpf_helpers->bpf_object_open_skeleton = NULL;
-        bpf_helpers->bpf_object_destroy_skeleton = NULL;
-        bpf_helpers->bpf_object_load_skeleton = NULL;
-        bpf_helpers->bpf_object_attach_skeleton = NULL;
-        bpf_helpers->bpf_object_detach_skeleton = NULL;
-
-        // eBPF FIM generic functions
-	    bpf_helpers->init_ring_buffer = NULL;
-	    bpf_helpers->ebpf_pop_events = NULL;
-	    bpf_helpers->check_invalid_kernel_version = NULL;
-	    bpf_helpers->init_libbpf = NULL;
-	    bpf_helpers->init_bpfobj = NULL;
-
-        // Free the loaded module (library)
-        if (bpf_helpers->module != NULL) {
-            dlclose(bpf_helpers->module);
-            bpf_helpers.reset();
-        }
-
-        result = true;
+    if (!bpf_helpers) {
+        return false;
     }
 
-    return result;
+    void* mod = bpf_helpers->module;
+    *bpf_helpers = w_bpf_helpers_t{};
+
+    if (mod) {
+        dlclose(mod);
+        bpf_helpers.reset();
+    }
+
+    return true;
 }
 
 
 int init_ring_buffer(ring_buffer** rb, ring_buffer_sample_fn sample_cb);
 void ebpf_pop_events(fim::BoundedQueue<std::unique_ptr<dynamic_file_event>>& kernel_queue);
-int check_invalid_kernel_version();
 int init_libbpf(std::unique_ptr<DynamicLibraryWrapper> sym_load);
 int init_bpfobj();
 

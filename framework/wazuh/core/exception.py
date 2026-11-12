@@ -130,6 +130,12 @@ class WazuhException(Exception):
                               'To solve this, check your connection to the Virus Total API or disable the public key'
                               ' protection in the API settings: '
                               f"https://documentation.wazuh.com/{DOCU_VERSION}/user-manual/api/configuration.html"},
+        1132: {'message': 'The ruleset exceeds the rule tree node limit',
+               'remediation': 'Review the rules that are added as children of many other rules, for example with '
+                              'broad "if_group", "if_sid" or "if_level" conditions, or adjust '
+                              '"analysisd.rule_tree_memory_limit" in "local_internal_options.conf". It accepts a '
+                              'memory size, such as 2G, or a percentage of memory, such as 50%'
+               },
         # Rule: 1200 - 1299
         1200: {'message': 'Error reading rules from `WAZUH_HOME/etc/ossec.conf`',
                'remediation': f'Please, visit the official documentation (https://documentation.wazuh.com/'
@@ -178,6 +184,9 @@ class WazuhException(Exception):
                                '(https://documentation.wazuh.com/'
                               f'{DOCU_VERSION}/user-manual/reference/ossec-conf/ruleset.html)'
                               ' to get more information about the rules'
+               },
+        1212: {'message': 'Invalid filename. It resolves outside of the expected rules directory.',
+               'remediation': 'Please, do not use path traversal sequences in the filename'
                },
 
         # Stats: 1300 - 1399
@@ -259,6 +268,9 @@ class WazuhException(Exception):
                                '(https://documentation.wazuh.com/'
                               f'{DOCU_VERSION}/user-manual/reference/ossec-conf/ruleset.html)'
                               ' to get more information about the decoders'
+               },
+        1508: {'message': 'Invalid filename. It resolves outside of the expected decoders directory.',
+               'remediation': 'Please, do not use path traversal sequences in the filename'
                },
 
         # Syscheck/AR: 1600 - 1699
@@ -528,6 +540,7 @@ class WazuhException(Exception):
         3050: "Payload size exceeds maximum allowed limit",
         3051: "Too many concurrent divided messages",
         3052: "Invalid cluster file parameter",
+        3053: "Decompressed file exceeds the maximum allowed size",
         3060: {'message': "Invalid node name format",
                'remediation': f"Check and fix [worker names](https://documentation.wazuh.com/{DOCU_VERSION}/"
                               f"user-manual/reference/ossec-conf/cluster.html#node-name)"

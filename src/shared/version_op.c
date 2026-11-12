@@ -393,6 +393,8 @@ const char *OSX_ReleaseName(int version) {
     /* 22 */ "Ventura",
     /* 23 */ "Sonoma",
     /* 24 */ "Sequoia",
+    /* 25 */ "Tahoe",
+    /* 26 */ "Golden Gate",
     };
 
     version -= 10;
@@ -400,7 +402,7 @@ const char *OSX_ReleaseName(int version) {
     if (version >= 0 && (unsigned)version < sizeof(R_NAMES) / sizeof(char *)) {
         return R_NAMES[version];
     } else {
-        return "Unknown";
+        return OSX_UNKNOWN_RELEASE_NAME;
     }
 }
 
@@ -415,6 +417,7 @@ os_info *get_unix_version()
     char *version = NULL;
     char *version_id = NULL;
     char *codename = NULL;
+    char *rhel_version = NULL;
     char *save_ptr = NULL;
     regmatch_t match[2];
     int match_size;
@@ -467,6 +470,16 @@ os_info *get_unix_version()
                         }
                         info->os_platform = strdup(id);
                     }
+                } else if (strcmp (tag,"RHEL_VERSION") == 0) {
+                    if (!rhel_version) {
+                        char *value = strtok_r(NULL, "\n", &save_ptr);
+                        if (value) {
+                            if (value[0] == '\"' && (end = strchr(++value, '\"'), end)) {
+                                *end = '\0';
+                            }
+                            os_strdup(value, rhel_version);
+                        }
+                    }
                 }
             }
         }
@@ -500,8 +513,35 @@ os_info *get_unix_version()
                           strcmp(info->os_platform, "arch") == 0) {
                 os_free(info->os_version);
                 os_strdup("", info->os_version);
+            } else if (strcmp(info->os_platform, "sles") == 0 ||
+                          strcmp(info->os_platform, "sled") == 0) {
+                // SUSE Linux Enterprise (Server/Desktop) reports VERSION as
+                // "<major>-SP<minor>" (e.g. "15-SP6") instead of the host-readable
+                // "<major>.<minor>" (e.g. "15.6") used by VERSION_ID.
+                if (info->os_version) {
+                    regmatch_t match[3];
+                    if (w_regexec("^([0-9]+)-[Ss][Pp]([0-9]+)$", info->os_version, 3, match)) {
+                        int major_size = match[1].rm_eo - match[1].rm_so;
+                        int minor_size = match[2].rm_eo - match[2].rm_so;
+                        char *new_version;
+                        os_malloc(major_size + minor_size + 2, new_version);
+                        snprintf(new_version, major_size + minor_size + 2, "%.*s.%.*s",
+                                 major_size, info->os_version + match[1].rm_so,
+                                 minor_size, info->os_version + match[2].rm_so);
+                        os_free(info->os_version);
+                        info->os_version = new_version;
+                    }
+                }
+            } else if (strcmp(info->os_platform, "rhcos") == 0) {
+                // RHCOS up to OpenShift 4.19 reports the OpenShift release in VERSION/VERSION_ID;
+                // the RHEL base is only in RHEL_VERSION.
+                if (rhel_version && w_regexec("^[0-9]+", rhel_version, 0, NULL)) {
+                    os_free(info->os_version);
+                    os_strdup(rhel_version, info->os_version);
+                }
             }
         }
+        os_free(rhel_version);
     }
 
     if (!info->os_name || (!info->os_version && !info->os_build) || !info->os_platform) {
@@ -788,7 +828,13 @@ os_info *get_unix_version()
                             char *kern = NULL;
                             os_malloc(match_size + 1, kern);
                             snprintf(kern, match_size +1, "%.*s", match_size, buff + match[1].rm_so);
-                            w_strdup(OSX_ReleaseName(atoi(kern)), info->os_codename);
+                            const char *release_name = OSX_ReleaseName(atoi(kern));
+                            /* Leave the codename unset for Darwin versions that are not in the release
+                             * name table yet, so the reported version stays clean instead of showing
+                             * "<version> (Unknown)" on every macOS release newer than the table. */
+                            if (strcmp(release_name, OSX_UNKNOWN_RELEASE_NAME) != 0) {
+                                w_strdup(release_name, info->os_codename);
+                            }
                             free(kern);
                         }
                         pclose(cmd_output_ver);

@@ -13,6 +13,7 @@
 #include <cmocka.h>
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 
 #include "../wrappers/common.h"
 #include "../wrappers/wazuh/client-agent/start_agent.h"
@@ -31,6 +32,8 @@ extern void send_msg_on_startup(void);
 extern bool agent_handshake_to_server(int server_id, bool is_startup);
 extern void send_agent_stopped_message();
 extern int _s_verify_counter;
+extern atomic_int_t recv_poll_timeout;
+extern bool poll_fallback_logged;
 
 int __wrap_send_msg(const char *msg, ssize_t msg_length) {
     check_expected(msg);
@@ -116,8 +119,14 @@ static int setup_test(void **state) {
     agt->events_persec = 500;
     agt->flags.auto_restart = 1;
     agt->crypto_method = W_METH_AES;
+    /* connect_server() now takes send_mutex, and agt->sock is this project's
+     * portable atomic_int_t (headers/atomic.h), not a plain int: initialize
+     * both mutexes for real instead of relying on calloc()'s zero bytes
+     * behaving like PTHREAD_MUTEX_INITIALIZER (a glibc-specific assumption). */
+    sender_init();
+    w_mutex_init(&agt->sock.mutex, NULL);
     /* Connected sock */
-    agt->sock = -1;
+    atomic_int_set(&agt->sock, -1);
     /* Server */
     add_server_config("127.0.0.1", IPPROTO_UDP);
     add_server_config("127.0.0.2", IPPROTO_TCP);
@@ -134,11 +143,14 @@ static int setup_test(void **state) {
     os_set_agent_crypto_method(&keys,agt->crypto_method);
 
     _s_verify_counter = 0;
+    poll_fallback_logged = false;
+    wrap_sockopt_errno = 0;
 
     return 0;
 }
 
 static int teardown_test(void **state) {
+    wrap_sockopt_errno = 0;
     for (unsigned i=0; agt->server[i].rip; i++) {
         os_free(agt->server[i].rip);
     }
@@ -150,6 +162,160 @@ static int teardown_test(void **state) {
 
 /* tests */
 /* connect_server */
+
+/* TCP connection where OS_SetKeepalive fails: mwarn is emitted but the
+ * connection is still established and send timeout is still applied. */
+static void test_connect_server_keepalive_fails(void **state) {
+    bool connected = false;
+
+    will_return(__wrap_getDefine_Int, 5);
+    expect_string(__wrap_OS_GetHost, host, agt->server[1].rip);
+    will_return(__wrap_OS_GetHost, strdup("127.0.0.2"));
+
+    expect_any(__wrap_OS_ConnectTCP, _port);
+    expect_any(__wrap_OS_ConnectTCP, _ip);
+    expect_any(__wrap_OS_ConnectTCP, ipv6);
+    will_return(__wrap_OS_ConnectTCP, 10);
+    /* No previous socket to close (agt->sock == -1 in setup) */
+    will_return(__wrap_OS_SetKeepalive, -1);   /* keepalive fails */
+    /* OS_SetKeepalive_Options must NOT be called (it is inside the else branch) */
+    will_return(__wrap_getDefine_Int, 30);     /* send_timeout still queried */
+    will_return(__wrap_OS_SetSendTimeout, 0);
+    will_return(__wrap_OS_SetRecvTimeout, 0);
+
+    expect_any(__wrap__minfo, formatted_msg);       /* "Trying to connect to server..." */
+    expect_any(__wrap__mwarn, formatted_msg);       /* "OS_SetKeepalive failed..." */
+
+    connected = connect_server(1, true);
+    assert_true(connected);
+    assert_int_equal(atomic_int_get(&agt->sock), 10);
+    assert_int_equal(agt->rip_id, 1);
+}
+
+/* TCP connection where OS_SetSendTimeout fails: mwarn is emitted but the
+ * connection is still established. */
+static void test_connect_server_send_timeout_fails(void **state) {
+    bool connected = false;
+
+    errno = 0;
+
+    will_return(__wrap_getDefine_Int, 5);
+    expect_string(__wrap_OS_GetHost, host, agt->server[1].rip);
+    will_return(__wrap_OS_GetHost, strdup("127.0.0.2"));
+
+    expect_any(__wrap_OS_ConnectTCP, _port);
+    expect_any(__wrap_OS_ConnectTCP, _ip);
+    expect_any(__wrap_OS_ConnectTCP, ipv6);
+    will_return(__wrap_OS_ConnectTCP, 10);
+    will_return(__wrap_OS_SetKeepalive, 0);
+#ifndef TEST_WINAGENT
+    expect_function_call(__wrap_OS_SetKeepalive_Options);
+    will_return(__wrap_getDefine_Int, 60);   /* tcp_keepidle */
+    will_return(__wrap_getDefine_Int, 15);   /* tcp_keepintvl */
+    will_return(__wrap_getDefine_Int, 4);    /* tcp_keepcnt */
+#endif
+    will_return(__wrap_getDefine_Int, 30);   /* send_timeout */
+    will_return(__wrap_OS_SetSendTimeout, -1);  /* send timeout fails */
+    will_return(__wrap_OS_SetRecvTimeout, 0);
+
+    expect_any(__wrap__minfo, formatted_msg);       /* "Trying to connect to server..." */
+    expect_any(__wrap__mwarn, formatted_msg);       /* "OS_SetSendTimeout failed..." */
+
+    connected = connect_server(1, true);
+    assert_true(connected);
+    assert_int_equal(atomic_int_get(&agt->sock), 10);
+    assert_int_equal(agt->rip_id, 1);
+}
+
+#ifndef TEST_WINAGENT
+/* TCP connection where the socket timeouts are unsupported (ENOPROTOOPT):
+ * no warning is logged and the handshake reply gets a poll() bound. A later
+ * connection that doesn't need it clears the bound. */
+static void test_connect_server_timeouts_unsupported(void **state) {
+    bool connected = false;
+
+    errno = 0;
+
+    will_return(__wrap_getDefine_Int, 5);
+    expect_string(__wrap_OS_GetHost, host, agt->server[1].rip);
+    will_return(__wrap_OS_GetHost, strdup("127.0.0.2"));
+
+    expect_any(__wrap_OS_ConnectTCP, _port);
+    expect_any(__wrap_OS_ConnectTCP, _ip);
+    expect_any(__wrap_OS_ConnectTCP, ipv6);
+    will_return(__wrap_OS_ConnectTCP, 10);
+    will_return(__wrap_OS_SetKeepalive, 0);
+    expect_function_call(__wrap_OS_SetKeepalive_Options);
+    will_return(__wrap_getDefine_Int, 60);   /* tcp_keepidle */
+    will_return(__wrap_getDefine_Int, 15);   /* tcp_keepintvl */
+    will_return(__wrap_getDefine_Int, 4);    /* tcp_keepcnt */
+    will_return(__wrap_getDefine_Int, 30);   /* send_timeout */
+    wrap_sockopt_errno = ENOPROTOOPT;
+    will_return(__wrap_OS_SetSendTimeout, -1);
+    will_return(__wrap_OS_SetRecvTimeout, -1);
+
+    expect_any(__wrap__minfo, formatted_msg);       /* "Trying to connect to server..." */
+    expect_any(__wrap__mdebug1, formatted_msg);     /* poll() fallback, logged once */
+
+    connected = connect_server(1, true);
+    assert_true(connected);
+    assert_int_equal(atomic_int_get(&agt->sock), 10);
+    assert_int_equal(atomic_int_get(&recv_poll_timeout), 5);
+
+    /* Next connection (UDP) must not inherit the bound */
+    will_return(__wrap_getDefine_Int, 5);
+    expect_string(__wrap_OS_GetHost, host, agt->server[0].rip);
+    will_return(__wrap_OS_GetHost, strdup("127.0.0.1"));
+    will_return(__wrap_OS_ConnectUDP, 11);
+    expect_value(__wrap_OS_CloseSocket, sock, 10);
+    will_return(__wrap_OS_CloseSocket, 0);
+
+    expect_any_count(__wrap__minfo, formatted_msg, 2);
+
+    connected = connect_server(0, true);
+    assert_true(connected);
+    assert_int_equal(atomic_int_get(&recv_poll_timeout), 0);
+}
+
+/* Handshake reply over a TCP socket without SO_RCVTIMEO is read with the poll() bound */
+static void test_agent_handshake_to_server_poll_timeout(void **state) {
+    errno = 0;
+
+    will_return(__wrap_getDefine_Int, 5);
+    expect_string(__wrap_OS_GetHost, host, agt->server[1].rip);
+    will_return(__wrap_OS_GetHost, strdup("127.0.0.2"));
+
+    expect_any(__wrap_OS_ConnectTCP, _port);
+    expect_any(__wrap_OS_ConnectTCP, _ip);
+    expect_any(__wrap_OS_ConnectTCP, ipv6);
+    will_return(__wrap_OS_ConnectTCP, 22);
+    will_return(__wrap_OS_SetKeepalive, 0);
+    expect_function_call(__wrap_OS_SetKeepalive_Options);
+    will_return(__wrap_getDefine_Int, 60);  /* tcp_keepidle */
+    will_return(__wrap_getDefine_Int, 15);  /* tcp_keepintvl */
+    will_return(__wrap_getDefine_Int, 4);   /* tcp_keepcnt */
+    will_return(__wrap_getDefine_Int, 30);  /* send_timeout */
+    wrap_sockopt_errno = ENOPROTOOPT;
+    will_return(__wrap_OS_SetSendTimeout, -1);
+    will_return(__wrap_OS_SetRecvTimeout, -1);
+    will_return(__wrap_wnet_select, 1);
+    expect_any(__wrap_OS_RecvSecureTCPTimeout, sock);
+    expect_any(__wrap_OS_RecvSecureTCPTimeout, size);
+    expect_value(__wrap_OS_RecvSecureTCPTimeout, timeout, 5);
+    will_return(__wrap_OS_RecvSecureTCPTimeout, SERVER_ENC_ACK);
+    will_return(__wrap_OS_RecvSecureTCPTimeout, strlen(SERVER_ENC_ACK));
+    expect_string(__wrap_send_msg, msg, "#!-agent startup {\"version\":\"v4.5.0\"}");
+    expect_string(__wrap_ReadSecMSG, buffer, SERVER_ENC_ACK);
+    will_return(__wrap_ReadSecMSG, "#!-agent ack ");
+    will_return(__wrap_ReadSecMSG, KS_VALID);
+
+    expect_any_count(__wrap__minfo, formatted_msg, 2);
+    expect_any(__wrap__mdebug1, formatted_msg);
+
+    assert_true(agent_handshake_to_server(1, false));
+}
+#endif
+
 static void test_connect_server(void **state) {
     bool connected = false;
     expect_any(__wrap__minfo, formatted_msg);
@@ -163,7 +329,7 @@ static void test_connect_server(void **state) {
 
     connected = connect_server(0, true);
     assert_int_equal(agt->rip_id, 0);
-    assert_int_equal(agt->sock, 11);
+    assert_int_equal(atomic_int_get(&agt->sock), 11);
     assert_true(connected);
 
     /* Connect to second server (TCP), previous connection must be closed*/
@@ -177,12 +343,22 @@ static void test_connect_server(void **state) {
     will_return(__wrap_OS_ConnectTCP, 12);
     expect_value(__wrap_OS_CloseSocket, sock, 11);
     will_return(__wrap_OS_CloseSocket, 0);
+    will_return(__wrap_OS_SetKeepalive, 0);
+#ifndef TEST_WINAGENT
+    expect_function_call(__wrap_OS_SetKeepalive_Options);
+    will_return(__wrap_getDefine_Int, 60);  /* tcp_keepidle */
+    will_return(__wrap_getDefine_Int, 15);  /* tcp_keepintvl */
+    will_return(__wrap_getDefine_Int, 4);   /* tcp_keepcnt */
+#endif
+    will_return(__wrap_getDefine_Int, 30);  /* send_timeout */
+    will_return(__wrap_OS_SetSendTimeout, 0);
+    will_return(__wrap_OS_SetRecvTimeout, 0);
 
     expect_any_count(__wrap__minfo, formatted_msg, 2);
 
     connected = connect_server(1, true);
     assert_int_equal(agt->rip_id, 1);
-    assert_int_equal(agt->sock, 12);
+    assert_int_equal(atomic_int_get(&agt->sock), 12);
     assert_true(connected);
 
     /* Connect to third server (UDP), valid host name*/
@@ -195,7 +371,7 @@ static void test_connect_server(void **state) {
 
     connected = connect_server(2, true);
     assert_int_equal(agt->rip_id, 2);
-    assert_int_equal(agt->sock, 13);
+    assert_int_equal(atomic_int_get(&agt->sock), 13);
     assert_true(connected);
 
     /* Connect to fourth server (UDP), invalid host name*/
@@ -256,11 +432,22 @@ static void test_agent_handshake_to_server(void **state) {
     will_return(__wrap_OS_ConnectTCP, 22);
     expect_value(__wrap_OS_CloseSocket, sock, 21);
     will_return(__wrap_OS_CloseSocket, 0);
+    will_return(__wrap_OS_SetKeepalive, 0);
+#ifndef TEST_WINAGENT
+    expect_function_call(__wrap_OS_SetKeepalive_Options);
+    will_return(__wrap_getDefine_Int, 60);  /* tcp_keepidle */
+    will_return(__wrap_getDefine_Int, 15);  /* tcp_keepintvl */
+    will_return(__wrap_getDefine_Int, 4);   /* tcp_keepcnt */
+#endif
+    will_return(__wrap_getDefine_Int, 30);  /* send_timeout */
+    will_return(__wrap_OS_SetSendTimeout, 0);
+    will_return(__wrap_OS_SetRecvTimeout, 0);
     will_return(__wrap_wnet_select, 1);
-    expect_any(__wrap_OS_RecvSecureTCP, sock);
-    expect_any(__wrap_OS_RecvSecureTCP, size);
-    will_return(__wrap_OS_RecvSecureTCP, SERVER_ENC_ACK);
-    will_return(__wrap_OS_RecvSecureTCP, strlen(SERVER_ENC_ACK));
+    expect_any(__wrap_OS_RecvSecureTCPTimeout, sock);
+    expect_any(__wrap_OS_RecvSecureTCPTimeout, size);
+    expect_value(__wrap_OS_RecvSecureTCPTimeout, timeout, 0);
+    will_return(__wrap_OS_RecvSecureTCPTimeout, SERVER_ENC_ACK);
+    will_return(__wrap_OS_RecvSecureTCPTimeout, strlen(SERVER_ENC_ACK));
     expect_string(__wrap_send_msg, msg, "#!-agent startup {\"version\":\"v4.5.0\"}");
     expect_string(__wrap_ReadSecMSG, buffer, SERVER_ENC_ACK);
     will_return(__wrap_ReadSecMSG, "#!-agent ack ");
@@ -282,11 +469,22 @@ static void test_agent_handshake_to_server(void **state) {
     will_return(__wrap_OS_ConnectTCP, 23);
     expect_value(__wrap_OS_CloseSocket, sock, 22);
     will_return(__wrap_OS_CloseSocket, 0);
+    will_return(__wrap_OS_SetKeepalive, 0);
+#ifndef TEST_WINAGENT
+    expect_function_call(__wrap_OS_SetKeepalive_Options);
+    will_return(__wrap_getDefine_Int, 60);  /* tcp_keepidle */
+    will_return(__wrap_getDefine_Int, 15);  /* tcp_keepintvl */
+    will_return(__wrap_getDefine_Int, 4);   /* tcp_keepcnt */
+#endif
+    will_return(__wrap_getDefine_Int, 30);  /* send_timeout */
+    will_return(__wrap_OS_SetSendTimeout, 0);
+    will_return(__wrap_OS_SetRecvTimeout, 0);
     will_return(__wrap_wnet_select, 1);
-    expect_any(__wrap_OS_RecvSecureTCP, sock);
-    expect_any(__wrap_OS_RecvSecureTCP, size);
-    will_return(__wrap_OS_RecvSecureTCP, SERVER_ENC_ACK);
-    will_return(__wrap_OS_RecvSecureTCP, strlen(SERVER_ENC_ACK));
+    expect_any(__wrap_OS_RecvSecureTCPTimeout, sock);
+    expect_any(__wrap_OS_RecvSecureTCPTimeout, size);
+    expect_value(__wrap_OS_RecvSecureTCPTimeout, timeout, 0);
+    will_return(__wrap_OS_RecvSecureTCPTimeout, SERVER_ENC_ACK);
+    will_return(__wrap_OS_RecvSecureTCPTimeout, strlen(SERVER_ENC_ACK));
     expect_string(__wrap_send_msg, msg, "#!-agent startup {\"version\":\"v4.5.0\"}");
     expect_string(__wrap_send_msg, msg, "1:wazuh-agent:ossec: Agent started: 'agent0->any'.");
     expect_string(__wrap_ReadSecMSG, buffer, SERVER_ENC_ACK);
@@ -448,6 +646,12 @@ static void test_send_agent_stopped_message(void **state) {
 
 int main(void) {
     const struct CMUnitTest tests[] = {
+        cmocka_unit_test_setup_teardown(test_connect_server_keepalive_fails, setup_test, teardown_test),
+        cmocka_unit_test_setup_teardown(test_connect_server_send_timeout_fails, setup_test, teardown_test),
+#ifndef TEST_WINAGENT
+        cmocka_unit_test_setup_teardown(test_connect_server_timeouts_unsupported, setup_test, teardown_test),
+        cmocka_unit_test_setup_teardown(test_agent_handshake_to_server_poll_timeout, setup_test, teardown_test),
+#endif
         cmocka_unit_test_setup_teardown(test_connect_server, setup_test, teardown_test),
         cmocka_unit_test_setup_teardown(test_agent_handshake_to_server, setup_test, teardown_test),
         cmocka_unit_test_setup_teardown(test_agent_handshake_to_server_invalid_version, setup_test, teardown_test),

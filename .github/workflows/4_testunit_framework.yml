@@ -13,14 +13,16 @@ on:
         required: false
         default: 'main'
   pull_request:
+    types: [synchronize, opened, reopened, ready_for_review]
     paths:
       - '.github/workflows/4_testunit_framework.yml'
       - 'framework/**'
       - 'api/**'
 
 jobs:
-  build: 
-    runs-on: codebuild-github-actions-codebuild-runner-server-amd-${{ github.run_id }}-${{ github.run_attempt }}
+  build:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -46,13 +48,14 @@ jobs:
         env:
           TEST_REPORT_PATH: ${{ runner.temp }}/test_report.txt
         run: |
-          set -o pipefail 
+          set -o pipefail
           python -m pytest framework -vv --ignore=tests --cov=framework | tee "${TEST_REPORT_PATH}"
-      
+
       - name: Generate test report
         if: inputs.generate_report
         env:
+          INPUT_QA_BRANCH: ${{ inputs.qa_branch }}
           TEST_REPORT_PATH: ${{ runner.temp }}/test_report.txt
         run: |
-          git clone -b ${{ inputs.qa_branch }} --single-branch https://github.com/wazuh/qa-integration-framework.git
+          git clone -b "$INPUT_QA_BRANCH" --single-branch https://github.com/wazuh/qa-integration-framework.git
           python qa-integration-framework/src/wazuh_testing/scripts/pytest_results_parser.py -f "${TEST_REPORT_PATH}"

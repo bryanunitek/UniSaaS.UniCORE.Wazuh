@@ -3,7 +3,7 @@
 # This program is free software; you can redistribute it and/or modify it under the terms of GPLv2
 
 from os import remove
-from os.path import exists, join, normpath, commonpath
+from os.path import exists, join, normpath, commonpath, realpath
 from typing import Union, Tuple
 from xml.parsers.expat import ExpatError
 
@@ -476,6 +476,10 @@ def upload_rule_file(filename: str, content: str, relative_dirname: str = None,
         full_path = join(common.WAZUH_PATH, relative_dirname, filename)
         if wazuh_error:
             raise wazuh_error
+        # If filename resolves outside the validated rules directory (path traversal).
+        base_path = join(common.WAZUH_PATH, relative_dirname)
+        if commonpath([realpath(full_path), realpath(base_path)]) != realpath(base_path):
+            raise WazuhError(1212)
         if len(content) == 0:
             raise WazuhError(1112)
 
@@ -495,14 +499,16 @@ def upload_rule_file(filename: str, content: str, relative_dirname: str = None,
 
         upload_file(content, to_relative_path(full_path))
 
-        # After uploading the file, validate it using a logtest dummy msg
+        # After uploading the file, validate it using a logtest dummy msg.
+        # On any failure, including socket errors when analysisd stops during the validation, remove the file if
+        # there was no previous version. A previous version is restored from the backup.
         try:
             validate_dummy_logtest()
-        except WazuhError as exc:
-            if not overwrite and exists(full_path):
+        except Exception:
+            if not backup_file and exists(full_path):
                 delete_rule_file(filename=filename, relative_dirname=relative_dirname)
 
-            raise exc
+            raise
 
         result.affected_items.append(to_relative_path(full_path))
         result.total_affected_items = len(result.affected_items)
@@ -542,6 +548,10 @@ def delete_rule_file(filename: Union[str, list], relative_dirname: str = None) -
         full_path = join(common.WAZUH_PATH, relative_dirname, file)
         if wazuh_error:
             raise wazuh_error
+
+        base_path = join(common.WAZUH_PATH, relative_dirname)
+        if commonpath([realpath(full_path), realpath(base_path)]) != realpath(base_path):
+            raise WazuhError(1212)
 
         if exists(full_path):
             try:

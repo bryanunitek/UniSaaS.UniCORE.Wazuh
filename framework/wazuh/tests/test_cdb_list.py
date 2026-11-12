@@ -297,6 +297,7 @@ def test_get_path_lists_sort(iterate_mock):
     ('test_file', True, 'test-ossec-w:write\ntest-ossec-r:read\ntest-ossec-x:execute\n', 0),
     ('test_file', False, {'test-ossec-w': 'write', 'test-ossec-r': 'read', 'test-ossec-x': 'execute'}, 0),
 ])
+@patch('wazuh.cdb_list.common.USER_LISTS_PATH', new=DATA_PATH)
 def test_get_list_file(filename, raw, expected_result, total_failed_items):
     """Test that get_list_file calls functions with expected params and it searches filename recursively.
 
@@ -319,6 +320,16 @@ def test_get_list_file(filename, raw, expected_result, total_failed_items):
             isinstance(result, AffectedItemsWazuhResult)
             assert result.render()['data']['total_failed_items'] == total_failed_items
             assert result.render()['data']['affected_items'][0] == expected_result
+
+
+@patch('wazuh.cdb_list.common.USER_LISTS_PATH', new=DATA_PATH)
+def test_get_list_file_outside_lists_path():
+    """Check that a filename resolving outside the lists directory is rejected and not read."""
+    with patch('wazuh.cdb_list.get_list_from_file') as mock_get_list_from_file:
+        result = get_list_file(['../../outside/file'], raw=True)
+        assert isinstance(result, AffectedItemsWazuhResult)
+        assert result.render()['data']['failed_items'][0]['error']['code'] == 1804
+        mock_get_list_from_file.assert_not_called()
 
 
 @patch('wazuh.cdb_list.safe_move')
@@ -373,6 +384,18 @@ def test_upload_list_file_ko(mock_remove, mock_lists_path):
                         upload_list_file(filename='test', content='test:content', overwrite=False)
 
 
+@patch('wazuh.cdb_list.upload_file')
+@patch('wazuh.cdb_list.safe_move')
+@patch('wazuh.cdb_list.exists', return_value=False)
+def test_upload_list_file_path_traversal(mock_exists, mock_safe_move, mock_upload_file):
+    """Check that a filename with path traversal sequences is rejected and the file is not written."""
+    result = upload_list_file(filename='../../../../../../tmp/poc_cdb_traversal',
+                              content='test_key:test_value\n', overwrite=True)
+    assert isinstance(result, AffectedItemsWazuhResult)
+    assert result.render()['data']['failed_items'][0]['error']['code'] == 1805
+    mock_upload_file.assert_not_called()
+
+
 @patch('wazuh.core.cdb_list.delete_wazuh_file')
 def test_delete_list_file(mock_delete_file):
     """Check that expected result is returned when the file is deleted."""
@@ -399,3 +422,38 @@ def test_delete_list_file_ko():
     with patch('wazuh.cdb_list.common.USER_LISTS_PATH', new=DATA_PATH):
         result = delete_list_file(['test_file'])
         assert result.render()['data']['failed_items'][0]['error']['code'] == 1906
+
+
+@patch('wazuh.cdb_list.common.USER_LISTS_PATH', new=DATA_PATH)
+def test_get_lists_outside_lists_path():
+    """Check that a file resolving outside the lists directory is not read nor returned."""
+    outside_file = os.path.join(DATA_PATH, os.pardir, 'outside_list')
+    try:
+        with open(outside_file, 'w') as f:
+            f.write('key:value\n')
+        with patch('wazuh.cdb_list.get_filenames_paths', return_value=[outside_file]):
+            with patch('wazuh.cdb_list.get_list_from_file') as mock_get_list_from_file:
+                result = get_lists(filename=['outside_list'])
+                assert isinstance(result, AffectedItemsWazuhResult)
+                assert result.total_affected_items == 0
+                assert result.affected_items == []
+                mock_get_list_from_file.assert_not_called()
+    finally:
+        try:
+            os.remove(outside_file)
+        except Exception:
+            pass
+
+
+@pytest.mark.parametrize("filename", [
+    '../../../../../../etc/passwd',
+    os.path.join(DATA_PATH, os.pardir, 'rbac.db'),
+])
+@patch('wazuh.cdb_list.common.USER_LISTS_PATH', new=DATA_PATH)
+@patch('wazuh.cdb_list.delete_list')
+def test_delete_list_file_path_traversal(mock_delete_list, filename):
+    """Check that a filename resolving outside the lists directory is rejected and not deleted."""
+    result = delete_list_file([filename])
+    assert isinstance(result, AffectedItemsWazuhResult)
+    assert result.render()['data']['failed_items'][0]['error']['code'] == 1804
+    mock_delete_list.assert_not_called()

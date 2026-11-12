@@ -11,13 +11,58 @@
 #include "shared.h"
 #include "os_regex/os_regex.h"
 #include "execd.h"
+#include "active-response/active_responses.h"
 
-static char exec_names[MAX_AR + 1][OS_FLSIZE + 1];
-static char exec_cmd[MAX_AR + 1][OS_FLSIZE + 1];
-static int  exec_timeout[MAX_AR + 1];
-static int  exec_size = 0;
-static int  f_time_reading = 1;
+/* Number of command slots the table grows by */
+#define EXEC_TABLE_CHUNK 32
 
+typedef struct exec_entry {
+    char *name;
+    char *cmd;
+    int timeout;
+} exec_entry_t;
+
+static exec_entry_t *exec_table = NULL;
+static int exec_size = 0;
+static int exec_capacity = 0;
+static int f_time_reading = 1;
+static int f_max_reported = 0;
+
+/* Discard the loaded commands, keeping the allocated slots for the next read */
+static void ClearExecTable()
+{
+    int i;
+
+    for (i = 0; i < exec_size; i++) {
+        os_free(exec_table[i].name);
+        os_free(exec_table[i].cmd);
+        exec_table[i].timeout = 0;
+    }
+
+    exec_size = 0;
+}
+
+/* Append a command to the table, growing it when there is no slot left */
+static void AddExecEntry(const char *name, const char *cmd, int timeout)
+{
+    if (exec_size == exec_capacity) {
+        exec_capacity += EXEC_TABLE_CHUNK;
+        os_realloc(exec_table, exec_capacity * sizeof(exec_entry_t), exec_table);
+    }
+
+    os_strdup(name, exec_table[exec_size].name);
+    os_strdup(cmd, exec_table[exec_size].cmd);
+    exec_table[exec_size].timeout = timeout;
+    exec_size++;
+}
+
+/* Release the command table */
+void FreeExecConfig()
+{
+    ClearExecTable();
+    os_free(exec_table);
+    exec_capacity = 0;
+}
 
 /* Read the shared exec config
  * Returns 1 on success or 0 on failure
@@ -25,18 +70,15 @@ static int  f_time_reading = 1;
  */
 int ReadExecConfig()
 {
-    int i = 0, j = 0, dup_entry = 0;
+    int j = 0, dup_entry = 0, truncated = 0;
     FILE *fp;
     FILE *process_file;
     char buffer[OS_MAXSTR + 1];
+    char name[OS_FLSIZE + 1];
+    char cmd[OS_FLSIZE + 1];
 
     /* Clean up */
-    for (i = 0; i <= exec_size + 1; i++) {
-        memset(exec_names[i], '\0', OS_FLSIZE + 1);
-        memset(exec_cmd[i], '\0', OS_FLSIZE + 1);
-        exec_timeout[i] = 0;
-    }
-    exec_size = 0;
+    ClearExecTable();
 
     /* Open file */
     fp = wfopen(DEFAULTAR, "r");
@@ -51,6 +93,8 @@ int ReadExecConfig()
         char *tmp_str;
 
         str_pt = buffer;
+        name[0] = '\0';
+        cmd[0] = '\0';
 
         // The command name must not start with '!'
 
@@ -69,12 +113,12 @@ int ReadExecConfig()
         tmp_str += 3;
 
         /* Set the name */
-        const int bytes_written = snprintf(exec_names[exec_size], sizeof(exec_names[exec_size]), "%s", str_pt);
+        const int bytes_written = snprintf(name, sizeof(name), "%s", str_pt);
 
         if (bytes_written < 0) {
-            merror(EXEC_BAD_NAME " Error %d (%s).", exec_names[exec_size], errno, strerror(errno));
-        } else if ((size_t)bytes_written >= sizeof(exec_names[exec_size])) {
-            merror(EXEC_BAD_NAME, exec_names[exec_size]);
+            merror(EXEC_BAD_NAME " Error %d (%s).", name, errno, strerror(errno));
+        } else if ((size_t)bytes_written >= sizeof(name)) {
+            merror(EXEC_BAD_NAME, name);
         }
 
         str_pt = tmp_str;
@@ -92,22 +136,21 @@ int ReadExecConfig()
 
         if (w_ref_parent_folder(str_pt)) {
             merror("Active response command '%s' vulnerable to directory traversal attack. Ignoring.", str_pt);
-            exec_cmd[exec_size][0] = '\0';
         } else {
             /* Write the full command path */
-            snprintf(exec_cmd[exec_size], OS_FLSIZE,
+            snprintf(cmd, OS_FLSIZE,
                      "%s/%s",
                      AR_BINDIR,
                      str_pt);
-            process_file = wfopen(exec_cmd[exec_size], "r");
+            process_file = wfopen(cmd, "r");
             if (!process_file) {
                 if (f_time_reading) {
                     minfo("Active response command not present: '%s'. "
                             "Not using it on this system.",
-                            exec_cmd[exec_size]);
+                            cmd);
                 }
 
-                exec_cmd[exec_size][0] = '\0';
+                cmd[0] = '\0';
             } else {
                 fclose(process_file);
             }
@@ -119,39 +162,49 @@ int ReadExecConfig()
             *tmp_str = '\0';
         }
 
-        /* Get the exec timeout */
-        exec_timeout[exec_size] = atoi(str_pt);
-
         /* Check if name is duplicated */
         dup_entry = 0;
         for (j = 0; j < exec_size; j++) {
-            if (strcmp(exec_names[j], exec_names[exec_size]) == 0) {
-                if (exec_cmd[j][0] == '\0') {
-                    snprintf(exec_cmd[j], sizeof(exec_cmd[j]), "%s", exec_cmd[exec_size]);
+            if (strcmp(exec_table[j].name, name) == 0) {
+                if (exec_table[j].cmd[0] == '\0') {
+                    os_free(exec_table[j].cmd);
+                    os_strdup(cmd, exec_table[j].cmd);
                     dup_entry = 1;
                     break;
-                } else if (exec_cmd[exec_size][0] == '\0') {
+                } else if (cmd[0] == '\0') {
                     dup_entry = 1;
                 }
             }
         }
 
-        if (dup_entry) {
-            exec_cmd[exec_size][0] = '\0';
-            exec_names[exec_size][0] = '\0';
-            exec_timeout[exec_size] = 0;
-        } else {
-            exec_size++;
+        if (!dup_entry) {
+            if (exec_size == MAX_AR_COMMANDS) {
+                // No room left in the command table
+
+                truncated = 1;
+                break;
+            }
+
+            /* Get the exec timeout */
+            AddExecEntry(name, cmd, atoi(str_pt));
         }
     }
 
     fclose(fp);
     f_time_reading = 0;
 
+    /* Report only when the configuration starts being truncated */
+    if (truncated && !f_max_reported) {
+        merror(EXEC_MAX_AR, MAX_AR_COMMANDS, DEFAULTAR);
+    }
+
+    f_max_reported = truncated;
+
     return (1);
 }
 
 /* Returns a pointer to the command name (full path)
+ * The pointer is only valid until the next call to ReadExecConfig()
  * Returns NULL if name cannot be found
  * If timeout is not NULL, write the timeout for that
  * command to it
@@ -180,9 +233,9 @@ char *GetCommandbyName(const char *name, int *timeout)
     }
 
     for (; i < exec_size; i++) {
-        if (strcmp(name, exec_names[i]) == 0) {
-            *timeout = exec_timeout[i];
-            return (exec_cmd[i]);
+        if (strcmp(name, exec_table[i].name) == 0) {
+            *timeout = exec_table[i].timeout;
+            return (exec_table[i].cmd);
         }
     }
 
@@ -210,6 +263,24 @@ void ExecCmd(char *const *cmd)
     }
 
     return;
+}
+
+/* Record a restart.sh invocation in the active responses log */
+void ExecdLogRestart(char *const *cmd)
+{
+    char *args = w_strcat_list((char **)cmd + 1, ' ');
+    char *timestamp = w_get_timestamp(time(NULL));
+    FILE *fp = w_fopen_nofollow(AR_LOG_DIR, AR_LOG_FILE_NAME, "a");
+
+    if (fp) {
+        fprintf(fp, "%s %s %s\n", timestamp, cmd[0], args ? args : "");
+        fclose(fp);
+    } else if (errno == ELOOP || errno == EMLINK) {
+        mwarn("Active responses log '%s/%s' is not a regular file: dropping entry.", AR_LOG_DIR, AR_LOG_FILE_NAME);
+    }
+
+    os_free(timestamp);
+    os_free(args);
 }
 
 #else

@@ -32,10 +32,36 @@
 
 int timeout;    //timeout in seconds waiting for a server reply
 
+atomic_int_t recv_poll_timeout = ATOMIC_INT_INITIALIZER(0);
+STATIC bool poll_fallback_logged = false;
+
 static ssize_t receive_message(char *buffer, unsigned int max_lenght);
+static bool sockopt_unsupported(void);
+static void log_poll_fallback(void);
 static void w_agentd_keys_init (void);
 STATIC bool agent_handshake_to_server(int server_id, bool is_startup);
 STATIC void send_msg_on_startup(void);
+
+/**
+ * @brief Checks whether the last failed setsockopt() was rejected as unsupported (ENOPROTOOPT)
+ * */
+static bool sockopt_unsupported(void) {
+#ifdef WIN32
+    return false;
+#else
+    return errno == ENOPROTOOPT;
+#endif
+}
+
+/**
+ * @brief Logs, once per process, that poll() replaces the unsupported socket timeouts
+ * */
+static void log_poll_fallback(void) {
+    if (!poll_fallback_logged) {
+        poll_fallback_logged = true;
+        mdebug1("Socket timeouts (SO_SNDTIMEO/SO_RCVTIMEO) are not supported on this platform. Using poll() instead.");
+    }
+}
 
 /**
  * @brief Connects to a specified server
@@ -49,18 +75,24 @@ bool connect_server(int server_id, bool verbose)
 {
     timeout = getDefine_Int("agent", "recv_timeout", 1, 600);
 
-    /* Close socket if available */
-    if (agt->sock >= 0) {
-        OS_CloseSocket(agt->sock);
-        agt->sock = -1;
+    /* Close socket if available. Locked so a concurrent sender in send_msg()
+     * (which only ever touches agt->sock under this same mutex) can't read a
+     * descriptor that's being closed out from under it. */
+    send_mutex_lock();
+    int old_sock = atomic_int_get(&agt->sock);
+    bool had_old_socket = old_sock >= 0;
+    if (had_old_socket) {
+        OS_CloseSocket(old_sock);
+        atomic_int_set(&agt->sock, -1);
+    }
+    send_mutex_unlock();
 
-        if (agt->server[agt->rip_id].rip) {
-            if (verbose) {
-                minfo("Closing connection to server ([%s]:%d/%s).",
-                    agt->server[agt->rip_id].rip,
-                    agt->server[agt->rip_id].port,
-                    agt->server[agt->rip_id].protocol == IPPROTO_UDP ? "udp" : "tcp");
-            }
+    if (had_old_socket && agt->server[agt->rip_id].rip) {
+        if (verbose) {
+            minfo("Closing connection to server ([%s]:%d/%s).",
+                agt->server[agt->rip_id].rip,
+                agt->server[agt->rip_id].port,
+                agt->server[agt->rip_id].protocol == IPPROTO_UDP ? "udp" : "tcp");
         }
     }
 
@@ -93,14 +125,17 @@ bool connect_server(int server_id, bool verbose)
             agt->server[server_id].port,
             agt->server[server_id].protocol == IPPROTO_UDP ? "udp" : "tcp");
     }
+    int new_sock;
     if (agt->server[server_id].protocol == IPPROTO_UDP) {
-        agt->sock = OS_ConnectUDP(agt->server[server_id].port, ip_address, strchr(ip_address, ':') != NULL ? 1 : 0, agt->server[server_id].network_interface);
+        new_sock = OS_ConnectUDP(agt->server[server_id].port, ip_address, strchr(ip_address, ':') != NULL ? 1 : 0, agt->server[server_id].network_interface);
     } else {
-        agt->sock = OS_ConnectTCP(agt->server[server_id].port, ip_address, strchr(ip_address, ':') != NULL ? 1 : 0, agt->server[server_id].network_interface);
+        new_sock = OS_ConnectTCP(agt->server[server_id].port, ip_address, strchr(ip_address, ':') != NULL ? 1 : 0, agt->server[server_id].network_interface);
     }
 
-    if (agt->sock < 0) {
-        agt->sock = -1;
+    if (new_sock < 0) {
+        send_mutex_lock();
+        atomic_int_set(&agt->sock, -1);
+        send_mutex_unlock();
 
         if (verbose) {
             #ifdef WIN32
@@ -115,16 +150,92 @@ bool connect_server(int server_id, bool verbose)
                 int bmode = 1;
 
                 /* Set socket to non-blocking */
-                ioctlsocket(agt->sock, FIONBIO, (u_long FAR *) &bmode);
+                ioctlsocket(new_sock, FIONBIO, (u_long FAR *) &bmode);
             }
         #endif
+        int send_poll_timeout = 0;
+        atomic_int_set(&recv_poll_timeout, 0);
+
+        if (agt->server[server_id].protocol != IPPROTO_UDP) {
+            /* Detect a silently half-closed TCP connection (no FIN/RST seen)
+             * and bound how long a blocked send() may hold send_mutex. Applied
+             * on the local fd, before it's published to agt->sock, so no
+             * sender can ever observe an unconfigured socket. */
+            if (OS_SetKeepalive(new_sock) < 0) {
+#ifdef WIN32
+                mwarn("OS_SetKeepalive failed with error '%s'", win_strerror(WSAGetLastError()));
+#else
+                mwarn("OS_SetKeepalive failed with error '%s'", strerror(errno));
+#endif
+            } else {
+#if !defined(WIN32) && !defined(OpenBSD)
+                /* WIN32 and OpenBSD have no tunable keepalive parameters, so skip the call. */
+                int keepidle = getDefine_Int("agent", "tcp_keepidle", 1, 7200);
+                int keepintvl = getDefine_Int("agent", "tcp_keepintvl", 1, 100);
+                int keepcnt = getDefine_Int("agent", "tcp_keepcnt", 1, 50);
+                OS_SetKeepalive_Options(new_sock, keepidle, keepintvl, keepcnt);
+#endif
+            }
+
+            int send_timeout = getDefine_Int("agent", "send_timeout", 1, 600);
+            if (OS_SetSendTimeout(new_sock, send_timeout) < 0) {
+                if (sockopt_unsupported()) {
+                    send_poll_timeout = send_timeout;
+                    log_poll_fallback();
+                } else {
+#ifdef WIN32
+                    mwarn("OS_SetSendTimeout failed with error '%s'", win_strerror(WSAGetLastError()));
+#else
+                    mwarn("OS_SetSendTimeout failed with error '%s'", strerror(errno));
+#endif
+                }
+            }
+
+            /* Receives have no timeout by default (os_recv_waitall()), so a half-sent reply would hang forever;
+             * bound them here, through poll() when SO_RCVTIMEO is unsupported. */
+            if (OS_SetRecvTimeout(new_sock, timeout, 0) < 0) {
+                if (sockopt_unsupported()) {
+                    atomic_int_set(&recv_poll_timeout, timeout);
+                    log_poll_fallback();
+                } else {
+#ifdef WIN32
+                    mwarn("OS_SetRecvTimeout failed with error '%s'", win_strerror(WSAGetLastError()));
+#else
+                    mwarn("OS_SetRecvTimeout failed with error '%s'", strerror(errno));
+#endif
+                }
+            }
+        }
+
+        /* rip_id published before sock, both under the same lock: send_msg()
+         * reads agt->server[agt->rip_id].protocol to pick UDP vs TCP before
+         * it ever takes this mutex, so a sender must never be able to see the
+         * new socket paired with the previous (possibly different-protocol)
+         * server's rip_id. */
+        send_mutex_lock();
+        send_set_poll_timeout(send_poll_timeout);
         agt->rip_id = server_id;
+        atomic_int_set(&agt->sock, new_sock);
+        send_mutex_unlock();
+
         last_connection_time = (int)time(NULL);
         os_free(ip_address);
         return true;
     }
     os_free(ip_address);
     return false;
+}
+
+/* Common reconnect sequence: toggle the wait/status flags around start_agent(0).
+ * Defined here (not in agentd.c) because agentd.o is excluded from the Windows
+ * agent link, while start_agent.o is shared by every build target -- notify.c
+ * and receiver.c (the Windows receive loop) both call this too. */
+void reconnect_to_server(void) {
+    os_setwait();
+    w_agentd_state_update(UPDATE_STATUS, (void *) GA_STATUS_NACTIVE);
+    start_agent(0);
+    os_delwait();
+    w_agentd_state_update(UPDATE_STATUS, (void *) GA_STATUS_ACTIVE);
 }
 
 /* Send synchronization message to the server and wait for the ack */
@@ -257,8 +368,15 @@ static void w_agentd_keys_init (void) {
 static ssize_t receive_message(char *buffer, unsigned int max_lenght) {
 
     ssize_t recv_b = 0;
+    const int sock = atomic_int_get(&agt->sock);
+
+    if (sock < 0) {
+        /* FD_SET(-1, ...) is undefined behavior; nothing to wait on anyway. */
+        return 0;
+    }
+
     /* Read received reply */
-    switch (wnet_select(agt->sock, timeout)) {
+    switch (wnet_select(sock, timeout)) {
         case -1:
             merror(SELECT_ERROR, errno, strerror(errno));
             break;
@@ -270,10 +388,10 @@ static ssize_t receive_message(char *buffer, unsigned int max_lenght) {
         default:
             if (agt->server[agt->rip_id].protocol == IPPROTO_UDP) {
                 /* Receive response UDP*/
-                recv_b = recv(agt->sock, buffer, max_lenght, MSG_DONTWAIT);
+                recv_b = recv(sock, buffer, max_lenght, MSG_DONTWAIT);
             } else {
                 /* Receive response TCP*/
-                recv_b = OS_RecvSecureTCP(agt->sock, buffer, max_lenght);
+                recv_b = OS_RecvSecureTCPTimeout(sock, buffer, max_lenght, atomic_int_get(&recv_poll_timeout));
             }
 
             /* Successful response */
@@ -343,7 +461,11 @@ STATIC bool agent_handshake_to_server(int server_id, bool is_startup) {
 
     if (connect_server(server_id, true)) {
         /* Send start up message */
-        send_msg(msg, -1);
+        if (send_msg(msg, -1) != 0) {
+            /* send_msg() may have closed and invalidated agt->sock (e.g. a
+             * short write or a dead peer) -- nothing to read a reply from. */
+            return false;
+        }
 
         /* Read until our reply comes back */
         recv_b = receive_message(buffer, OS_MAXSTR);

@@ -156,6 +156,7 @@ STATIC char * wm_agent_upgrade_com_clear_result();
 STATIC int _jailfile(char finalpath[PATH_MAX + 1], const char * basedir, const char * filename);
 STATIC int _unsign(const char * source, char dest[PATH_MAX + 1]);
 STATIC int _uncompress(const char * source, const char *package, char dest[PATH_MAX + 1]);
+STATIC const char * _tmpBareName(const char * path);
 
 size_t wm_agent_upgrade_process_command(const char *buffer, char **output) {
     cJSON *buffer_obj = cJSON_Parse(buffer);
@@ -229,14 +230,31 @@ STATIC char * wm_agent_upgrade_com_open(const cJSON* json_object) {
         return wm_agent_upgrade_command_ack(ERROR_INVALID_FILE_NAME, error_messages[ERROR_INVALID_FILE_NAME]);
     }
 
-    if (file.fp = wfopen(final_path, mode_obj->valuestring), file.fp) {
+    // Not wfopen(): a symlink left at final_path would be followed, truncating its target.
+    file.fp = w_fopen_nofollow(INCOMING_DIR, file_path_obj->valuestring, mode_obj->valuestring);
+
+    if (file.fp) {
         snprintf(file.path, sizeof(file.path), "%s", final_path);
         return wm_agent_upgrade_command_ack(ERROR_OK, error_messages[ERROR_OK]);
     } else {
-        mterror(WM_AGENT_UPGRADE_LOGTAG, FOPEN_ERROR, file_path_obj->valuestring, errno, strerror(errno));
+        // Saved before logging: mterror() writes to the log file, which is free to clobber errno.
+        const int open_errno = errno;
+        // ELOOP is what w_fopen_nofollow() reports for a symlink: from O_NOFOLLOW on POSIX, and set
+        // explicitly on Windows when the handle turns out to be a reparse point. It gets its own message
+        // and its own reason text because both otherwise lean on strerror(), which says nothing useful
+        // here — mingw has no text for ELOOP and prints "Unknown error", hiding the one case worth
+        // alerting on. The error code stays ERROR_FILE_OPEN, so the response protocol is unchanged.
+        const char *reason = (open_errno == ELOOP) ? "the path is a symbolic link" : strerror(open_errno);
+
+        if (open_errno == ELOOP) {
+            mterror(WM_AGENT_UPGRADE_LOGTAG, WM_UPGRADE_SYMLINK_REJECTED, "open", file_path_obj->valuestring);
+        } else {
+            mterror(WM_AGENT_UPGRADE_LOGTAG, FOPEN_ERROR, file_path_obj->valuestring, open_errno, strerror(open_errno));
+        }
+
         char *output;
         os_malloc(OS_MAXSTR + 1, output);
-        snprintf(output, OS_MAXSTR + 1, error_messages[ERROR_FILE_OPEN], strerror(errno));
+        snprintf(output, OS_MAXSTR + 1, error_messages[ERROR_FILE_OPEN], reason);
         char *response = wm_agent_upgrade_command_ack(ERROR_FILE_OPEN, output);
         os_free(output);
         return response;
@@ -264,8 +282,10 @@ STATIC char * wm_agent_upgrade_com_write(const cJSON* json_object) {
         return wm_agent_upgrade_command_ack(ERROR_TARGET_FILE_NOT_MATCH, error_messages[ERROR_TARGET_FILE_NOT_MATCH]);
     }
 
-    char *base64_string = decode_base64(buffer_obj->valuestring);
-    if (value_obj && (value_obj->type == cJSON_Number) && base64_string && fwrite(base64_string, 1, value_obj->valueint, file.fp) == (unsigned)value_obj->valueint) {
+    size_t decoded_len = 0;
+    char *base64_string = cJSON_IsString(buffer_obj) ? decode_base64_len(buffer_obj->valuestring, &decoded_len) : NULL;
+    if (value_obj && (value_obj->type == cJSON_Number) && base64_string && value_obj->valueint >= 0 && (size_t)value_obj->valueint <= decoded_len
+        && fwrite(base64_string, 1, value_obj->valueint, file.fp) == (unsigned)value_obj->valueint) {
         os_free(base64_string);
         return wm_agent_upgrade_command_ack(ERROR_OK, error_messages[ERROR_OK]);
     } else {
@@ -352,8 +372,8 @@ STATIC char * wm_agent_upgrade_com_upgrade(const cJSON* json_object) {
         return wm_agent_upgrade_command_ack(ERROR_CLEAN_DIRECTORY, error_messages[ERROR_CLEAN_DIRECTORY]);
     }
 
-    //Unmerge
-    if (UnmergeFiles(merged, UPGRADE_DIR, OS_BINARY, NULL) == 0) {
+    // Unmerge, requiring every file of the package
+    if (UnmergeFiles(merged, UPGRADE_DIR, OS_BINARY, NULL) != UNMERGE_COMPLETE) {
         unlink(merged);
         mterror(WM_AGENT_UPGRADE_LOGTAG, WM_UPGRADE_UNMERGING_FILE_ERROR, "upgrade", merged);
         return wm_agent_upgrade_command_ack(ERROR_UNMERGE, error_messages[ERROR_UNMERGE]);
@@ -400,7 +420,10 @@ STATIC char * wm_agent_upgrade_com_clear_result() {
 
 STATIC int _jailfile(char finalpath[PATH_MAX + 1], const char * basedir, const char * filename) {
 
-    if (w_ref_parent_folder(filename)) {
+    // A bare file name is all that is ever legitimate here. Rejecting separators also keeps the
+    // directory-relative open in w_fopen_nofollow() confined to basedir, since a separator-containing
+    // or absolute name would otherwise be resolved ignoring the directory descriptor.
+    if (!w_is_bare_filename(filename)) {
         return -1;
     }
 
@@ -442,12 +465,17 @@ STATIC int _unsign(const char * source, char dest[PATH_MAX + 1]) {
     int fd;
 
     if (fd = mkstemp(dest), fd >= 0) {
-        close(fd);
-
-        if (chmod(dest, 0640) < 0) {
+        // Not chmod(dest, ...): between mkstemp() creating dest and a name-based chmod() looking
+        // it up again, dest could be unlinked and replaced with a symlink, making chmod() follow
+        // it and change an unrelated target's mode. fd is already open on the exact file mkstemp()
+        // created, so fchmod() skips that second lookup entirely.
+        if (fchmod(fd, 0640) < 0) {
+            close(fd);
             unlink(dest);
             mterror(WM_AGENT_UPGRADE_LOGTAG, WM_UPGRADE_CHMOD_ERROR, "unsign()", dest);
             output = -1;
+        } else {
+            close(fd);
         }
     } else {
 #else
@@ -465,6 +493,25 @@ STATIC int _unsign(const char * source, char dest[PATH_MAX + 1]) {
     umask(old_mask);
     unlink(source);
     return output;
+}
+
+// _jailfile() always builds its output as TMP_DIR followed by a path separator and a bare filename;
+// this recovers that bare filename instead of blindly skipping strlen(TMP_DIR) + 1 bytes, which would
+// walk past the string's NUL terminator (and hand a garbage pointer to w_gzopen_nofollow/w_fopen_nofollow)
+// for any path that turns out not to actually start with that prefix.
+STATIC const char * _tmpBareName(const char * path) {
+    const size_t prefixLen = strlen(TMP_DIR) + 1;
+#ifndef WIN32
+    const char SEP = '/';
+#else
+    const char SEP = '\\';
+#endif
+
+    if (strlen(path) <= prefixLen || strncmp(path, TMP_DIR, strlen(TMP_DIR)) != 0 || path[strlen(TMP_DIR)] != SEP) {
+        return NULL;
+    }
+
+    return path + prefixLen;
 }
 
 STATIC int _uncompress(const char * source, const char *package, char dest[PATH_MAX + 1]) {
@@ -489,16 +536,63 @@ STATIC int _uncompress(const char * source, const char *package, char dest[PATH_
         memcpy(dest + length, TEMPLATE, sizeof(TEMPLATE));
     }
 
-    if (fsource = gzopen(source, "rb"), !fsource) {
+    // Not gzopen(): a symlink left at source would be followed, disclosing whatever it points to.
+    const char * sourceBareName = _tmpBareName(source);
+
+    if (!sourceBareName || (fsource = w_gzopen_nofollow(TMP_DIR, sourceBareName, "rb"), !fsource)) {
         mterror(WM_AGENT_UPGRADE_LOGTAG, WM_UPGRADE_FILE_OPEN_ERROR, "uncompress()", source);
         return -1;
     }
 
-    if (ftarget = wfopen(dest, "wb"), !ftarget) {
+    // dest still holds the literal template here: unlike _unsign() above, it was never expanded into a
+    // unique name, leaving a predictable path a symlink could be pre-planted at before wfopen() opened
+    // it. Expand it now and, on POSIX, reuse the descriptor mkstemp() already vetted instead of a second,
+    // name-based open that would reintroduce the same race.
+#ifndef WIN32
+    {
+        int fd;
+
+        if (fd = mkstemp(dest), fd < 0) {
+            gzclose(fsource);
+            mterror(WM_AGENT_UPGRADE_LOGTAG, WM_UPGRADE_COMPRESSED_FILE_ERROR, "uncompress()");
+            return -1;
+        }
+
+        // Not chmod(dest, ...): between mkstemp() creating dest and a name-based chmod() looking
+        // it up again, dest could be unlinked and replaced with a symlink, making chmod() follow
+        // it and change an unrelated target's mode. fd is already open on the exact file mkstemp()
+        // created, so fchmod() skips that second lookup entirely.
+        if (fchmod(fd, 0640) < 0) {
+            unlink(dest);
+            close(fd);
+            gzclose(fsource);
+            mterror(WM_AGENT_UPGRADE_LOGTAG, WM_UPGRADE_CHMOD_ERROR, "uncompress()", dest);
+            return -1;
+        }
+
+        if (ftarget = fdopen(fd, "wb"), !ftarget) {
+            unlink(dest);
+            close(fd);
+            gzclose(fsource);
+            mterror(WM_AGENT_UPGRADE_LOGTAG, WM_UPGRADE_FILE_OPEN_ERROR, "uncompress()", dest);
+            return -1;
+        }
+    }
+#else
+    if (_mktemp_s(dest, strlen(dest) + 1)) {
+        gzclose(fsource);
+        mterror(WM_AGENT_UPGRADE_LOGTAG, WM_UPGRADE_COMPRESSED_FILE_ERROR, "uncompress()");
+        return -1;
+    }
+
+    const char * destBareName = _tmpBareName(dest);
+
+    if (!destBareName || (ftarget = w_fopen_nofollow(TMP_DIR, destBareName, "wb"), !ftarget)) {
         gzclose(fsource);
         mterror(WM_AGENT_UPGRADE_LOGTAG, WM_UPGRADE_FILE_OPEN_ERROR, "uncompress()", dest);
         return -1;
     }
+#endif
 
     {
         int length;
